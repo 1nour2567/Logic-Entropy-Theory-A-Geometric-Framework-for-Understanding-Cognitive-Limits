@@ -1,5 +1,17 @@
 # Logic-Entropy-Theory-A-Geometric-Framework-for-Understanding-Cognitive-Limits
 🌌 理论核心：逻辑的熵与认知纤维丛 逻辑不是永恒的真理框架，而是在熵增定律支配下演化出的认知工具。我们提出"逻辑的熵"理论，将哥德尔不完备性、图灵停机问题与热力学第二定律统一在认知热力学的新范式下，为理解理性边界提供了深刻的数学基础。
+
+🧠 Theory Overview
+The "Logic Entropy" theory proposes that:
+
+Formal logic systems have inherent "logical entropy" that increases with reflexive operations
+
+Gödel's incompleteness theorems are instances of "logical entropy increase"
+
+Cognitive systems undergo phase transitions at critical reflexive loads
+
+Geometric structures (fiber bundles) provide the mathematical foundation
+
 🚀 核心突破
 揭示了深度学习的原理性局限：Transformer在符号推理任务上完全失败（0%成功率）
 
@@ -16,6 +28,33 @@ MinimalArithmeticExtension.py：Q→PA扩展的极简模拟
 EnhancedArithmeticSimulation.py：增强版，包含统计显著性检验
 
 AdvancedStatisticalAnalysis.py：ANOVA、效应量、贝叶斯分析
+
+🧪 Experiments Included
+Minimal Arithmetic Simulation: Q → PA extension with cognitive dynamics
+
+Enhanced Statistical Analysis: ANOVA, effect sizes, Bayesian methods
+
+Fair Comparison Experiments: Geometric vs. Transformer models
+
+Nuclear Comparison: Geometric vs. state-of-the-art LLMs (Llama-3, DeepSeek-Math)
+
+
+# 逻辑熵理论：几何认知架构 vs 深度学习
+
+一个完整的计算框架，验证"逻辑的熵"理论——形式逻辑系统在反身性操作下会经历不可逆的熵增，类似于热力学系统。
+
+## 🚀 快速开始
+
+```bash
+# 克隆仓库
+git clone https://github.com/yourusername/logic-entropy-thesis.git
+cd logic-entropy-thesis
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 运行完整实验
+python run_experiment.py
 
 2. 公平对比层
 SharedTaskExperiment.py：几何模型 vs Transformer的公平对比
@@ -94,41 +133,23 @@ from experiments.enhanced_statistics import EnhancedArithmeticSimulation
 sim = EnhancedArithmeticSimulation()
 sim.run_multiple_trials(n_trials=100)
 
+🔧 Requirements
+Python 3.8+
+
+PyTorch 2.0+
+
+NumPy, SciPy, Matplotlib
+
+For nuclear comparison: GPU with 16GB+ VRAM, vllm
+
 # 3. 模型对比
 from experiments.fair_comparison import SharedTaskExperiment
 experiment = SharedTaskExperiment()
 results = experiment.run_comparison(n_trials=100)
-📁 项目结构
-text
-Logic-Entropy-Experimental-Framework/
-├── README.md                           # 本项目说明
-├── requirements.txt                    # 依赖库
-├── CITATION.cff                        # 引用信息
-├── experiments/                        # 主要实验
-│   ├── 01_minimal_simulation.py        # 极简算术扩展模拟
-│   ├── 02_enhanced_statistics.py       # 增强统计验证
-│   ├── 03_fair_comparison.py           # 公平对比实验
-│   ├── 04_transformer_comparison.py    # Transformer对比
-│   └── run_all_experiments.py          # 一键运行所有实验
-├── analysis/                           # 分析工具
-│   ├── statistical_framework.py        # 高级统计分析
-│   ├── visualization_suite.py          # 可视化工具
-│   └── performance_optimizer.py        # 性能优化
-├── models/                             # 模型定义
-│   ├── geometric_cognitive_model.py    # 几何认知模型
-│   ├── trained_transformer.py          # 训练好的Transformer
-│   └── enhanced_geometric_model.py     # 增强几何模型
-├── data/                               # 实验数据
-│   ├── results_summary.csv             # 结果汇总
-│   └── figures/                        # 生成图表
-├── docs/                               # 理论文档
-│   ├── theory_intro.md                 # 理论介绍
-│   ├── mathematical_foundations.md     # 数学基础
-│   └── experimental_design.md          # 实验设计
-└── paper/                              # 论文材料
-    ├── manuscript.md                   # 论文草稿
-    ├── abstract.txt                    # 摘要
-    └── figures/                        # 发表级图表
+
+🤝 Contributing
+This is a research project. While contributions are welcome, please open an issue first to discuss proposed changes.
+
 📚 理论文档
 理论介绍
 逻辑的熵：从热力学到认知宇宙论
@@ -192,7 +213,14 @@ Logic-Entropy-Experimental-Framework/
 
 路线图
 
+🙏 Acknowledgments
+Kurt Gödel for incompleteness theorems
 
+Immanuel Kant for transcendental philosophy
+
+Claude Shannon for information theory
+
+The open-source community for PyTorch and scientific Python
 
 📞 联系与支持
 问题与讨论：GitHub Issues
