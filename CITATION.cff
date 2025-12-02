@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - given-names: "1nour2567"
+    family-names: "1nour2567"
+    affiliation: "1nour2567"
+    email: "m19165009848@163.com"
+title: "Cognitive Geometric Architecture: A Computational Framework for Logic Entropy Theory"
+version: 1.0.0
+date-released: 2025-01-01
+url: "https://github.com/1nour2567/logic-entropy-thesis"
+repository-code: "https://github.com/1nour2567/logic-entropy-thesis"
+license: MIT
+abstract: "This repository presents a complete computational framework for testing the 'Logic Entropy' theory, which proposes that formal logical systems undergo irreversible entropy increase under reflexive operations, analogous to thermodynamic systems."
