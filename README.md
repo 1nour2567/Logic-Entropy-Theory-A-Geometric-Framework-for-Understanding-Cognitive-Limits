@@ -176,9 +176,8 @@ Logic-Entropy-Experimental-Framework/
 📄 引用本工作
 如果您在研究中使用了本框架，请引用：
 
-bibtex
-@software{LogicEntropy2025,
-  author = {您的名字},
+
+  author = {续仁舞},
   title = {Logic Entropy Experimental Framework},
   year = {2025},
   url = {https://github.com/yourusername/Logic-Entropy-Experimental-Framework},
@@ -193,13 +192,12 @@ bibtex
 
 路线图
 
-📜 许可证
-本项目采用 MIT 许可证 - 查看 LICENSE 文件了解详情。
+
 
 📞 联系与支持
 问题与讨论：GitHub Issues
 
-电子邮件：your.email@example.com
+电子邮件：m19165009848@example.com
 
 学术合作：欢迎认知科学、AI、数学、哲学领域的研究者合作
 
