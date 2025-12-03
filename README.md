@@ -38,6 +38,18 @@ Fair Comparison Experiments: Geometric vs. Transformer models
 
 Nuclear Comparison: Geometric vs. state-of-the-art LLMs (Llama-3, DeepSeek-Math)
 
+## 🧪 Dynamic Axiom Extension Transformer
+
+### Overview
+We implement a novel Transformer architecture with **dynamic axiom memory**, 
+which learns and applies mathematical axioms during reasoning. This corresponds 
+to the "reflexive constraints" in the Logic Entropy theory.
+
+### Key Innovation
+- **Axiom Memory Pool**: Learnable matrix storing mathematical axioms
+- **Dynamic Attention**: Select relevant axioms for each input
+- **Gated Integration**: Control the influence strength (reflexive load λ)
+
 
 # 逻辑熵理论：几何认知架构 vs 深度学习
 
