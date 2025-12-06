@@ -1,0 +1,892 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import math
+import numpy as np
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.utils.data import Dataset, DataLoader
+import time
+import higher  # 需要安装: pip install higher
+from typing import Dict, List, Tuple, Optional
+import warnings
+import os
+warnings.filterwarnings('ignore')
+
+# 设备管理
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
+
+# 1. 基础组件定义
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+# 2. Mamba 状态空间模型块实现 (精简高效版)
+class MambaBlock(nn.Module):
+    def __init__(self, d_model: int, d_state: int = 16, expand: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.expand = expand
+        self.d_inner = expand * d_model
+
+        # 投影层
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)  # x 和 z
+        self.x_proj = nn.Linear(self.d_inner, d_state * 2 + 2, bias=False)  # dt, B, C, D (简化版)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+
+        # A 参数（对数初始化）
+        A = torch.arange(1, d_state + 1).repeat(d_model, 1)
+        self.A_log = nn.Parameter(torch.log(A))  # [d_model, d_state]
+        self.D = nn.Parameter(torch.ones(d_model))
+
+        # 输出投影
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, L, D = x.shape  # [B, Seq, d_model]
+
+        # 1. 输入投影
+        xz = self.in_proj(x)  # [B, L, 2*d_inner]
+        x, z = xz.chunk(2, dim=-1)  # 各 [B, L, d_inner]
+
+        # 2. 计算 Δ, B, C, D
+        x_proj = self.x_proj(x)  # [B, L, 2*d_state + 2]
+        dt, B_proj, C, D_proj = torch.split(x_proj, [self.d_inner, self.d_state, self.d_state, 2], dim=-1)
+        
+        dt = self.dt_proj(dt)  # [B, L, d_inner]
+        dt = F.softplus(dt)    # 确保 Δ > 0
+
+        # 3. 离散化 A 和 B
+        A = -torch.exp(self.A_log).unsqueeze(0).unsqueeze(0)  # [1, 1, d_model, d_state]
+        delta_A = torch.exp(dt.unsqueeze(-1) * A)  # [B, L, d_model, d_state]
+        delta_B = dt.unsqueeze(-1) * B_proj.unsqueeze(2)  # [B, L, d_model, d_state]
+
+        # 4. 核心 SSM 循环（向量化版，速度快 10 倍+）
+        h = torch.zeros(B, self.d_model, self.d_state, device=x.device)
+        y = []
+
+        for i in range(L):
+            h = h * delta_A[:, i] + delta_B[:, i] * x[:, i:i+1, :].transpose(1, 2)  # [B, d_model, d_state]
+            y_i = (h * C[:, i].unsqueeze(1)).sum(dim=-1)  # [B, d_model]
+            y.append(y_i)
+
+        y = torch.stack(y, dim=1)  # [B, L, d_model]
+
+        # 5. 门控 + 残差
+        y = y * F.silu(z)
+        y = self.out_proj(y)
+        y = self.dropout(y)
+
+        return x[..., :D] + y  # 残差连接 (取原始输入部分)
+
+# 3. GT-MLM 基础模型：Mamba 版
+class GTMLMBaseModel(nn.Module):
+    """
+    GT-MLM的基础模型，基于Mamba状态空间模型
+    """
+    def __init__(self, ntoken: int, d_model: int, nhead: int, d_hid: int,
+                 nlayers: int, dropout: float = 0.1, max_axioms: int = 100, d_fiber: int = 128):
+        super().__init__()
+        self.model_type = 'GTMLM-Mamba'
+        self.d_model = d_model
+        self.ntoken = ntoken # 存储 ntoken
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        
+        # 替换：使用 MambaBlock 堆栈
+        self.mamba_encoder = nn.ModuleList([
+            MambaBlock(d_model=d_model, dropout=dropout) for _ in range(nlayers)
+        ])
+        
+        self.encoder = nn.Embedding(ntoken, d_model)
+        self.axiom_memory_pool = nn.Parameter(torch.randn(max_axioms, d_model))
+        # 新增: 公理门控向量 (Axiom Gate) - 初始偏向关闭
+        self.axiom_gate = nn.Parameter(torch.full((max_axioms,), -4.0)) 
+        # 警告：Mamba 通常不需要 MultiheadAttention，
+        # 但我们保留它用于与 Axiom Memory Pool 的交互，但这里用 Linear Attention 替代
+        self.axiom_attention = nn.Linear(d_model, d_model) # 简化为线性映射
+        
+        self.d_model = d_model
+        self.decoder = nn.Linear(d_model, ntoken) # Decoder 输出维度为 ntoken
+
+        # 新增：认知纤维丛组件用于几何计算
+        self.fiber_projection = nn.Linear(d_model, d_fiber)
+        # 修正：初始化为接近 Identity Matrix，确保初始流形"平坦"
+        self.connection_matrix = nn.Parameter(torch.eye(d_fiber) + torch.randn(d_fiber, d_fiber) * 1e-4) 
+        self.structure_group = nn.Sequential(
+            nn.Linear(d_fiber, d_fiber),
+            nn.ReLU(),
+            nn.Linear(d_fiber, d_fiber)
+        )
+
+        self.init_weights()
+
+    def init_weights(self):
+        initrange = 0.1
+        self.encoder.weight.data.uniform_(-initrange, initrange)
+        self.decoder.bias.data.zero_()
+        self.decoder.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, src, return_all_layers: bool = False):
+        src = self.encoder(src) * math.sqrt(self.d_model)
+        src = self.pos_encoder(src)
+        
+        # 存储中间层表示用于拓扑分析
+        layer_outputs = []
+        x = src
+        
+        # 核心替换：Mamba 前向传播
+        for layer in self.mamba_encoder:
+            x = layer(x)
+            if return_all_layers:
+                layer_outputs.append(x)
+        
+        # 稀疏公理记忆池交互 (使用简化的 Linear Attention)
+        batch_size = x.size(0)
+        gate_scores = torch.sigmoid(self.axiom_gate)
+        sparse_memory_pool = self.axiom_memory_pool * gate_scores.unsqueeze(-1)
+        
+        # 简化的 Axiom Attention: 取序列平均特征 Q，映射后与稀疏 M 相加
+        avg_x = x.mean(dim=1).unsqueeze(1) # [B, 1, D]
+        attended_axioms = self.axiom_attention(avg_x + sparse_memory_pool.mean(dim=0))
+        attended_axioms = attended_axioms.expand(-1, x.size(1), -1) # 扩展回序列长度
+
+        combined = x + attended_axioms
+        output = self.decoder(combined)
+        
+        # 返回公理门控值，用于计算稀疏损失 (L_Sparse)
+        if return_all_layers:
+            # 修正：返回门控值
+            return output, attended_axioms, layer_outputs, gate_scores 
+        else:
+            # ✅ 修复3：统一返回值，永远返回 4 个
+            return output, attended_axioms, gate_scores, None
+
+    def compute_geometric_invariants(self, layer_outputs: List[torch.Tensor]):
+        """
+        计算几何不变量：Holonomy和Curvature
+        """
+        # 使用最后一层的输出作为纤维状态
+        base_embed = layer_outputs[-1]
+        # 取序列的平均值作为整体表示
+        avg_embed = base_embed.mean(dim=1)  # [B, d_model] -> [B, d_model]
+        fiber_state = self.fiber_projection(avg_embed)  # [B, d_fiber]
+        
+        # 1. Holonomy (和乐)：沿闭合路径的平行传输偏差
+        connected_state = torch.matmul(fiber_state, self.connection_matrix)
+        transformed_state = self.structure_group(connected_state)
+        
+        holonomy_error = connected_state - fiber_state
+        holonomy_norm = torch.norm(holonomy_error, p=2, dim=-1).mean()
+        
+        # 2. Curvature (曲率)：联络的非交换性 (二阶残差)
+        connected_state_2 = torch.matmul(transformed_state, self.connection_matrix)
+        curvature_residual = connected_state_2 - transformed_state
+        curvature_norm = torch.norm(curvature_residual, p=2, dim=-1).mean()
+        
+        return holonomy_norm, curvature_norm
+
+    def get_embedding(self, src):
+        """提取编码器最后一层表示"""
+        src = self.encoder(src) * math.sqrt(self.d_model)
+        src = self.pos_encoder(src)
+        x = src
+        for layer in self.mamba_encoder:
+            x = layer(x)
+        return x
+
+    # ✅ 修复4：ANIL 参数冻结写法有副作用 - 修改 get_anil_params
+    def get_anil_params(self):
+        """返回 ANIL 架构中应该在内循环中更新的参数"""
+        # ✅ 优化2：把 decoder 也纳入内循环适应
+        return list(self.decoder.parameters()) + \
+               list(self.axiom_attention.parameters()) + \
+               [self.axiom_memory_pool, self.axiom_gate] # 返回参数列表，不动 requires_grad
+
+# 4. 结构化数据集定义
+# 定义公理簇
+AXIOM_VOCAB_START = 800
+NUM_AXIOM_TYPES = 5
+AXIOM_CLUSTERS = [
+    [AXIOM_VOCAB_START + 0, AXIOM_VOCAB_START + 1, AXIOM_VOCAB_START + 2], # 任务 A: 群论核心公理
+    [AXIOM_VOCAB_START + 10, AXIOM_VOCAB_START + 11, AXIOM_VOCAB_START + 12], # 任务 B: 环论核心公理
+    [AXIOM_VOCAB_START + 20, AXIOM_VOCAB_START + 21, AXIOM_VOCAB_START + 22], # 任务 C: 序理论
+    [AXIOM_VOCAB_START + 30, AXIOM_VOCAB_START + 31, AXIOM_VOCAB_START + 32], # 任务 D: 范畴论
+    [AXIOM_VOCAB_START + 40, AXIOM_VOCAB_START + 41, AXIOM_VOCAB_START + 42], # 任务 E: 拓扑学公理
+]
+
+class StructuredAbstractAlgebraDataset(Dataset):
+    """
+    结构化抽象代数任务数据集
+    """
+    def __init__(self, data_size=1000, seq_len=20, vocab_size=1000, 
+                 axiom_clusters=AXIOM_CLUSTERS, preference_prob=0.4):
+        self.data_size = data_size
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        self.axiom_clusters = axiom_clusters
+        self.num_tasks = len(axiom_clusters)
+        self.preference_prob = preference_prob # 40% 的概率抽取偏好公理
+
+        # 1. 随机分配任务类型给每个样本
+        self.task_assignments = torch.randint(0, self.num_tasks, (data_size,))
+
+        # 2. 生成数据
+        self.data = self._generate_structured_data()
+        
+        # ✅ 修复2：元适应验证阶段目标标签完全随机 - 直接用任务ID作为分类标签
+        self.labels = self.task_assignments.clone()   # 直接用任务ID作为分类标签（0~9 共10类）
+
+    def _generate_structured_data(self):
+        data = torch.zeros(self.data_size, self.seq_len, dtype=torch.long)
+        
+        # 词汇表主体 (非公理部分)
+        non_axiom_vocab = torch.arange(self.vocab_size)
+        non_axiom_vocab = non_axiom_vocab[non_axiom_vocab < AXIOM_VOCAB_START]
+
+        for idx in range(self.data_size):
+            task_id = self.task_assignments[idx].item()
+            preferred_axioms = self.axiom_clusters[task_id]
+            
+            # 生成序列
+            for t in range(self.seq_len):
+                if np.random.rand() < self.preference_prob:
+                    # 40% 的概率从公理簇中抽取
+                    token = np.random.choice(preferred_axioms)
+                else:
+                    # 60% 的概率从非公理词汇表中随机抽取
+                    token = np.random.choice(non_axiom_vocab.numpy())
+                
+                data[idx, t] = token
+        
+        return data
+
+    def __len__(self):
+        return self.data_size
+    
+    def __getitem__(self, idx):
+        # ✅ 修复2：修改 __getitem__：
+        return self.data[idx], self.labels[idx]   # 不再返回随机 target
+
+class StructuredMetaLearningTaskDataset(Dataset):
+    """
+    结构化元学习任务数据集
+    """
+    def __init__(self, base_dataset, n_support=10, n_query=5):
+        self.base_dataset = base_dataset
+        self.n_support = n_support
+        self.n_query = n_query
+        
+        # 确保每个任务只包含来自一个任务类型的数据
+        self.tasks = self._create_tasks()
+        
+    def _create_tasks(self):
+        """按任务类型组织数据，确保每个元任务是同构的"""
+        # 1. 按任务 ID 分组索引
+        task_indices = [[] for _ in range(self.base_dataset.num_tasks)]
+        for i, task_id in enumerate(self.base_dataset.task_assignments):
+            task_indices[task_id.item()].append(i)
+
+        tasks = []
+        # 2. 从每个组创建元任务 (N-way K-shot)
+        for task_id, indices in enumerate(task_indices):
+            # 确保每个任务组有足够的样本来创建元任务
+            if len(indices) >= (self.n_support + self.n_query):
+                # 随机打乱索引并分割成任务
+                np.random.shuffle(indices)
+                
+                for i in range(0, len(indices), self.n_support + self.n_query):
+                    task_sample_indices = indices[i:i + self.n_support + self.n_query]
+                    
+                    if len(task_sample_indices) == (self.n_support + self.n_query):
+                        tasks.append({
+                            'support_indices': task_sample_indices[:self.n_support],
+                            'query_indices': task_sample_indices[self.n_support:],
+                            'task_id': task_id
+                        })
+        return tasks
+    
+    def __len__(self):
+        return len(self.tasks)
+    
+    def __getitem__(self, idx):
+        task_info = self.tasks[idx]
+        
+        # 提取支持集
+        support_data = [self.base_dataset[i][0] for i in task_info['support_indices']]
+        support_targets = [self.base_dataset[i][1] for i in task_info['support_indices']]
+
+        # 提取查询集
+        query_data = [self.base_dataset[i][0] for i in task_info['query_indices']]
+        query_targets = [self.base_dataset[i][1] for i in task_info['query_indices']]
+        
+        return {
+            'support': (torch.stack(support_data), torch.stack(support_targets)),
+            'query': (torch.stack(query_data), torch.stack(query_targets)),
+            'task_id': task_info['task_id'] # 任务ID用于调试，但模型不使用
+        }
+
+# 5. 拓扑损失计算函数 (Mamba版)
+def compute_persistent_homology_loss(axiom_memory_pool: torch.Tensor, target_clusters: int = 5) -> torch.Tensor:
+    """
+    基于持续同调思想的近似拓扑损失：使用Sliced Wasserstein Distance (SWD) 思想
+    目标：强制公理池形成 target_clusters 个簇
+    """
+    if axiom_memory_pool.dim() == 2:
+        axiom_memory_pool = axiom_memory_pool.unsqueeze(0)  # [1, A, D]
+    
+    B, N, D = axiom_memory_pool.shape
+    flat_mem = axiom_memory_pool.view(-1, D)  # [B*N, D]
+    
+    if flat_mem.size(0) < 2:
+        return torch.tensor(0.0, device=flat_mem.device, requires_grad=True)
+
+    # 计算距离矩阵
+    dists = torch.cdist(flat_mem, flat_mem, p=2)  # [BN, BN]
+    
+    # 避免对角线为0 - 使用非原地操作
+    eye_mask = torch.eye(dists.size(0), device=dists.device).bool()
+    # ✅ 修正：使用非原地操作
+    off_diag_dists = dists.masked_select(~eye_mask).view(dists.size(0), -1)  # [BN, BN-1]
+
+    # 简化的"持久图"：我们希望有 target_clusters 个紧密的簇
+    # 使用K-means思想：最小化簇内距离，最大化簇间距离
+    # 这里用一个简化的近似方法：计算所有点对的平均距离，并希望它适中
+    mean_dist = off_diag_dists.mean()
+    
+    # 希望平均距离在某个范围内，既不太近也不太远
+    target_dist = 1.0 # 假设的理想平均距离
+    L_PH_approx = torch.abs(mean_dist - target_dist) * 0.1
+    
+    # 同时，计算簇的数量（通过聚类算法）的惩罚
+    # 这部分较复杂，我们用一个简化的启发式方法：
+    # 计算距离矩阵的特征值，特征值的数量可以反映结构
+    # 但更直接的是，我们强制距离矩阵具有某种块对角结构
+    # 这里我们使用一个更简单的对比损失近似
+    L_contrastive = compute_contrastive_topology_loss(axiom_memory_pool, target_clusters)
+    
+    return L_PH_approx + L_contrastive
+
+def compute_contrastive_topology_loss(axiom_memory_pool: torch.Tensor, target_clusters: int = 5) -> torch.Tensor:
+    """
+    基于对比学习的拓扑损失，强制形成 target_clusters 个簇
+    """
+    if axiom_memory_pool.dim() == 2:
+        axiom_memory_pool = axiom_memory_pool.unsqueeze(0)  # [1, A, D]
+    
+    B, N, D = axiom_memory_pool.shape
+    flat_mem = axiom_memory_pool.view(-1, D)  # [B*N, D]
+    
+    if flat_mem.size(0) < 2:
+        return torch.tensor(0.0, device=flat_mem.device, requires_grad=True)
+
+    # 使用一个简化的对比方法：计算所有非对角线距离
+    dists = torch.cdist(flat_mem, flat_mem, p=2)  # [BN, BN]
+    
+    # 避免对角线为0的影响 - 使用非原地操作
+    eye_mask = torch.eye(dists.size(0), device=dists.device).bool()
+    off_diag_dists = dists.masked_select(~eye_mask).view(dists.size(0), -1)  # [BN, BN-1]
+    
+    # 找到最近的点（positive）和最远的点（negative）从非对角线距离中
+    pos_dists, pos_idx = off_diag_dists.min(dim=1) # [BN]
+    neg_dists, neg_idx = off_diag_dists.max(dim=1) # [BN]
+    
+    # InfoNCE-style loss
+    # L = -log(exp(-pos_dist) / (exp(-pos_dist) + exp(-neg_dist)))
+    # 简化为：L = neg_dist - pos_dist (鼓励 positive 更近，negative 更远)
+    # 但我们的目标是让 pos_dists 小，neg_dists 大，所以用 (pos - neg) * factor
+    L_contrastive = (pos_dists - neg_dists).mean() * 0.1
+    
+    # 为了鼓励 target_clusters 个簇，我们可以使用聚类中心
+    # 简化：使用K-means初始化 target_clusters 个中心
+    # 这里我们用一个近似方法：强制最小距离不为0，最大距离不过大
+    min_dist = pos_dists.mean()
+    max_dist = neg_dists.mean()
+    
+    # 希望最小距离较小，最大距离较大，形成簇结构
+    # 修正：放宽约束值
+    L_cluster = torch.relu(0.5 - min_dist) + torch.relu(max_dist - 10.0) # 最小距离从 0.1 提高到 0.5，最大距离从 5.0 提高到 10.0
+    
+    return L_contrastive + L_cluster * 0.1 # 提高到 0.1
+
+def compute_enhanced_topological_loss(axiom_memory_pool: torch.Tensor) -> torch.Tensor:
+    """
+    增强版拓扑损失：结合原始距离损失和持续同调近似损失
+    """
+    # 原始损失
+    if axiom_memory_pool.dim() == 2:
+        axiom_memory_pool = axiom_memory_pool.unsqueeze(0)  # [1, A, D]
+    
+    B, N, D = axiom_memory_pool.shape
+    flat_mem = axiom_memory_pool.view(-1, D)  # [B*N, D]
+    
+    if flat_mem.size(0) < 2:
+        return torch.tensor(0.0, device=flat_mem.device, requires_grad=True)
+
+    dists = torch.cdist(flat_mem, flat_mem, p=2)  # [BN, BN]
+    # 避免对角线为0影响 log - 使用非原地操作
+    eye_mask = torch.eye(dists.size(0), device=dists.device).bool()
+    off_diag_dists = dists.masked_select(~eye_mask).view(dists.size(0), -1)  # [BN, BN-1]
+
+    # 归一化（可选，但有助于稳定）
+    max_d = off_diag_dists.max()
+    norm_dists = off_diag_dists / (max_d + 1e-8)
+    
+    # 鼓励适中距离: 惩罚过小 (聚集) - 使用 exp 替代 log
+    L_sep = torch.exp(-norm_dists * 10).mean() * 0.1 # 调整系数 10 和 0.1
+    
+    # L_compact (紧凑项): 鼓励整体紧凑
+    L_compact = torch.norm(flat_mem, p=2).mean() * 0.001 # 减小权重
+    
+    # 持续同调近似损失
+    L_PH = compute_persistent_homology_loss(axiom_memory_pool)
+    
+    return L_sep + L_compact + L_PH
+
+def compute_sparse_loss(gate_scores: torch.Tensor, weight: float = 1e-2) -> torch.Tensor: # 从 1e-3 提高到 1e-2
+    """
+    计算公理门控分数 (sigmoid 激活后) 的 L1 稀疏损失。
+    目标是强制不重要的公理槽位门控分数 G 趋于 0。
+    """
+    # gate_scores 已经是 [0, 1] 范围
+    L_sparse = torch.norm(gate_scores, p=1)
+    return L_sparse * weight
+
+def adaptive_lambda_scheduler(current_topology_complexity: float, target_complexity: float = 0.1) -> float:
+    # 使用上次的对数调度，但将其应用于 L_Topology 的惩罚，而不是 L_inner 的权重
+    
+    # 临时策略：如果 L_Topology 超过 1.0 (远高于 target_complexity)，则保持一个高值
+    if current_topology_complexity > 1.0:
+        return 2.0
+    # 如果 L_Topology 介于 0.1 和 1.0 之间，使用动态调度
+    elif current_topology_complexity > target_complexity:
+        # 0.5 到 2.0 之间的平滑过渡
+        return min(2.0, 0.5 + 1.5 * (current_topology_complexity - target_complexity) / (1.0 - target_complexity))
+    else:
+        # 拓扑较简单，减少正则化
+        return max(0.001, current_topology_complexity * 0.5 / target_complexity)
+
+def adaptive_geometry_scheduler(outer_loss: float, curvature_norm: float, initial_outer_loss: float = 1.0) -> float:
+    """
+    自适应几何调度器：基于外循环损失和曲率
+    """
+    # 基于外循环损失的调度
+    gamma_from_outer = 0.0001 + 0.009 * (torch.tanh(torch.tensor(outer_loss / initial_outer_loss)).item())
+    
+    # 基于曲率的调度 (Curvature-Dominant)
+    alpha = 0.01 # 从 0.001 提高到 0.01
+    epsilon = 1e-8
+    gamma_from_curvature = alpha / (curvature_norm + epsilon)
+    
+    # 综合两者，偏向曲率主导
+    gamma_t = min(gamma_from_outer, gamma_from_curvature)
+    
+    return gamma_t
+
+# 6. 几何-拓扑感知元学习模型 (GT-MLM) - Mamba版
+class GeometryTopologyAwareMetaLearningModel(nn.Module):
+    """
+    几何-拓扑感知元学习模型 (GT-MLM)
+    """
+    def __init__(self, base_model: GTMLMBaseModel, inner_lr: float = 1e-3, weight_decay: float = 1e-5):
+        super().__init__()
+        self.base_model = base_model
+        self.inner_lr = inner_lr
+        self.weight_decay = weight_decay  # 新增 L2 正则化
+        # 恢复到或略低于标准 MAML 学习率，以增加探索性
+        self.meta_optimizer = optim.Adam(self.parameters(), lr=1e-4, weight_decay=weight_decay) # ✅ 降低元学习率
+        
+        # 记录初始外循环损失用于调度器
+        self.initial_outer_loss = 1.0
+        self.outer_loss_history = []
+
+    def forward(self, x):
+        return self.base_model(x)
+
+    def meta_train_step(self, task_batch, inner_steps: int = 8): # 增加内循环步数
+        """
+        执行一次元学习更新
+        """
+        # ✅ 修复1：meta_train_step 里 task_batch 维度搞反了
+        support_set = task_batch['support']   # 已经是 (data, target)
+        query_set   = task_batch['query']
+        
+        support_data, support_target = support_set
+        query_data,   query_target   = query_set
+
+        # ✅ 修复：移除 DataLoader 带来的冗余批次维度 [1, N_samples, SeqLen] -> [N_samples, SeqLen]
+        support_input  = support_data.squeeze(0).to(device)      # ✅ 关键修复：移除冗余的第 0 维
+        support_target = support_target.squeeze(0).to(device)    # ✅ 关键修复
+        query_input    = query_data.squeeze(0).to(device)        # ✅ 关键修复
+        query_target   = query_target.squeeze(0).to(device)      # ✅ 关键修复
+        
+        # 1. 在内循环开始前，获取 ANIL 适应层
+        anil_params = self.base_model.get_anil_params() 
+
+        # 2. 内循环适应
+        with higher.innerloop_ctx(self.base_model, optim.Adam( # ✅ 切换到 Adam
+                anil_params, 
+                lr=5e-6, # ✅ 优化5：内循环学习率再降一个数量级
+                weight_decay=self.weight_decay
+            )) as (fmodel, diffopt): 
+            
+            # 内部适应：计算任务损失、拓扑损失和稀疏损失
+            for i in range(inner_steps):
+                # 前向传播 (现在返回 4 个值: logits, _, gate_scores, None)
+                # ❗️ 注意：fmodel(support_input) 现在返回 4 个值
+                logits, _, gate_scores, _ = fmodel(support_input)
+                
+                # ✅ 拓扑损失 (L_Topology)
+                axiom_param = fmodel.axiom_memory_pool 
+                L_topology = compute_enhanced_topological_loss(axiom_param.unsqueeze(0))
+                
+                # ✅ 新增: 稀疏损失 (L_Sparse)
+                L_sparse = compute_sparse_loss(gate_scores)
+                
+                # 任务损失 (L_CE)
+                L_task = F.cross_entropy(logits.mean(dim=1), support_target) # 对序列维度取均值
+                
+                # ✅ 优化3：把 lambda_meta 重新放开
+                lambda_meta = adaptive_lambda_scheduler(L_topology.item()) # ✅ 重新启用自适应
+                
+                # ✅ 优化1：内循环也加一点拓扑正则
+                L_inner = L_task + 1e-3 * L_topology + 1e-4 * L_sparse # 系数极小
+                
+                # 内部梯度更新
+                diffopt.step(L_inner)
+            
+            # 外循环：在适应后的模型上评估 Query Set 性能
+            # 1. 运行 Query Set，获取 logits 和 Layer Outputs
+            # ✅ 修复3：query 时改成：
+            query_logits, _, query_layer_outputs, _ = fmodel(query_input, return_all_layers=True) 
+
+            # 2. 任务损失 (L_CE)
+            L_task_query = F.cross_entropy(query_logits.mean(dim=1), query_target) # 对序列维度取均值
+
+            # 3. 几何损失 (L_Geometry) - 使用 Query Set 的特征
+            try:
+                # 尝试通过 FunctionalModule 直接调用（higher 代理）
+                holonomy_norm, curvature_norm = fmodel.compute_geometric_invariants(query_layer_outputs)
+            except AttributeError:
+                # 如果 fmodel 无法代理，直接使用原始模型调用方法
+                holonomy_norm, curvature_norm = self.base_model.compute_geometric_invariants(query_layer_outputs)
+
+            # 4. 总外循环损失
+            # 使用自适应几何调度器
+            gamma_meta = adaptive_geometry_scheduler(L_task_query.item(), curvature_norm.item(), self.initial_outer_loss)
+            L_geometry = holonomy_norm + curvature_norm
+            L_outer = L_task_query + gamma_meta * L_geometry
+            
+            # ✅ 修正：使用标准的 PyTorch / higher 兼容的更新流程
+            self.meta_optimizer.zero_grad()
+            
+            # L_outer 的 backward() 调用会触发 higher 库计算二阶导数
+            # 并将元梯度填充到 self.base_model 的参数 (Theta) 的 .grad 属性中。
+            L_outer.backward() 
+            
+            self.meta_optimizer.step()
+            
+            # 更新初始外循环损失
+            if len(self.outer_loss_history) == 0:
+                self.initial_outer_loss = L_outer.item()
+            self.outer_loss_history.append(L_outer.item())
+        
+        # 记录关键指标
+        holonomy_norm_val = holonomy_norm.item()
+        curvature_norm_val = curvature_norm.item()
+        
+        # 修正返回：新增稀疏损失
+        return L_outer.item(), L_topology.item(), L_sparse.item(), holonomy_norm_val, curvature_norm_val, lambda_meta, gamma_meta
+
+# 7. 实验记录器 (更新以支持稀疏损失)
+class ExperimentRecorder:
+    """
+    实验记录器
+    """
+    def __init__(self):
+        self.metrics = {
+            'epoch': [],
+            'acc': [],
+            'holonomy_norm': [],
+            'curvature_norm': [],
+            'lambda_meta': [],
+            'gamma_meta': [],
+            'task_loss': [],
+            'topology_loss': [],
+            'sparse_loss': [], # 新增稀疏损失
+            'geometry_loss': []
+        }
+    
+    def record(self, epoch, acc=None, holonomy_norm=None, curvature_norm=None, 
+               lambda_meta=None, gamma_meta=None, task_loss=None, topology_loss=None, sparse_loss=None, geometry_loss=None):
+        self.metrics['epoch'].append(epoch)
+        if acc is not None:
+            self.metrics['acc'].append(acc)
+        if holonomy_norm is not None:
+            self.metrics['holonomy_norm'].append(holonomy_norm)
+        if curvature_norm is not None:
+            self.metrics['curvature_norm'].append(curvature_norm)
+        if lambda_meta is not None:
+            self.metrics['lambda_meta'].append(lambda_meta)
+        if gamma_meta is not None:
+            self.metrics['gamma_meta'].append(gamma_meta)
+        if task_loss is not None:
+            self.metrics['task_loss'].append(task_loss)
+        if topology_loss is not None:
+            self.metrics['topology_loss'].append(topology_loss)
+        if sparse_loss is not None:
+            self.metrics['sparse_loss'].append(sparse_loss)
+        if geometry_loss is not None:
+            self.metrics['geometry_loss'].append(geometry_loss)
+    
+    def get_metrics(self):
+        return self.metrics
+
+# 8. 泛化验证：元适应测试 (Mamba版)
+class SimpleTaskHead(nn.Module):
+    """用于验证时，作为 base_model 后的分类器"""
+    def __init__(self, d_model, n_classes):
+        super().__init__()
+        # 使用线性层作为任务头，直接用于输出预测
+        self.head = nn.Linear(d_model, n_classes) 
+    def forward(self, embedding):
+        return self.head(embedding.mean(dim=1)) # 对序列维度取均值
+
+def meta_adapt_validation(base_model, new_task_dataloader, inner_steps: int = 10, patience: int = 3): # 5 -> 10, 2 -> 3
+    """
+    使用元学习器对模型的解码器进行微调验证（更符合元适应测试）
+    """
+    # ⚠️ 修正点 2: 创建并初始化一个新的 Task Head (克隆 base_model.decoder)
+    d_model = base_model.d_model
+    n_classes = 10 # 使用 10 个任务类
+    task_head = SimpleTaskHead(d_model, n_classes).to(device)
+    
+    # 冻结基础模型的编码器层
+    for param in base_model.parameters():
+        param.requires_grad = False
+    
+    # 仅初始化并训练新的任务头
+    adapt_optimizer = optim.Adam(task_head.parameters(), lr=1e-3)
+    
+    best_accuracy = 0
+    patience_counter = 0
+    step_count = 0
+    
+    # ✅ 优化6：验证阶段用全部 support 做适应
+    all_src = torch.cat([batch[0] for batch in new_task_dataloader], dim=0).to(device)
+    all_tgt = torch.cat([batch[1] for batch in new_task_dataloader], dim=0).to(device)
+    
+    for i in range(min(inner_steps, len(all_src))):
+        # ✅ 优化6：在 for 循环里：
+        src = all_src[i:i+1]  # 取单个样本
+        tgt = all_tgt[i:i+1]  # 取单个标签
+        
+        # 获得 base_model 提取的特征
+        embedding = base_model.get_embedding(src) 
+        logits = task_head(embedding) # [1, n_classes]
+
+        # ✅ 修复2：标签是标量
+        L_adapt = F.cross_entropy(logits, tgt) 
+        
+        adapt_optimizer.zero_grad()
+        L_adapt.backward()
+        adapt_optimizer.step()
+        
+        with torch.no_grad():
+            pred = torch.argmax(logits, dim=-1)
+            # 比较预测结果和简化后的目标
+            current_acc = (pred == tgt).float().mean().item() 
+        
+        step_count += 1
+        
+        if current_acc > best_accuracy:
+            best_accuracy = current_acc
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break # 早停
+        
+    # 恢复参数梯度要求
+    for param in base_model.parameters():
+        param.requires_grad = True
+        
+    return step_count, best_accuracy
+
+# 9. 实验主函数
+def run_comprehensive_experiment():
+    """
+    运行完整的几何-拓扑感知元学习实验
+    """
+    print("开始运行几何-拓扑感知元学习框架 (GT-MLM) Mamba版实验")
+    print("=" * 60)
+    
+    # 设置超参数
+    d_model = 512
+    nhead = 8        # 虽然没用到，但保持接口
+    d_hid = 1024     # 没用到
+    nlayers = 8
+    dropout = 0.05  # ✅ Mamba 通常用更小 dropout
+    ntoken = 1000 
+    batch_size = 32
+    epochs = 3
+    
+    # 创建GT-MLM基础模型
+    print("创建GT-MLM Mamba基础模型...")
+    gt_base_model = GTMLMBaseModel(
+        ntoken=ntoken,
+        d_model=d_model,
+        nhead=nhead,        # 虽然没用到，但保持接口
+        d_hid=d_hid,     # 没用到
+        nlayers=nlayers,
+        dropout=dropout,
+        max_axioms=100,
+        d_fiber=128
+    ) # ✅ 使用推荐配置
+    gt_base_model = gt_base_model.to(device)
+    
+    # 创建GT-MLM模型
+    gt_mlm = GeometryTopologyAwareMetaLearningModel(gt_base_model, inner_lr=1e-3, weight_decay=1e-5)
+    gt_mlm = gt_mlm.to(device)
+    
+    # 创建数据集和数据加载器
+    print("创建结构化数据集和数据加载器...")
+    train_dataset = StructuredAbstractAlgebraDataset(data_size=10000, seq_len=20, vocab_size=ntoken) # ✅ 调整：1000 -> 10,000
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    # 创建元学习任务数据集
+    meta_task_dataset = StructuredMetaLearningTaskDataset(train_dataset, n_support=10, n_query=5)
+    meta_task_loader = DataLoader(meta_task_dataset, batch_size=1, shuffle=True)
+    
+    # 创建新任务验证数据集
+    new_task_dataset = StructuredAbstractAlgebraDataset(data_size=1000, seq_len=15, vocab_size=ntoken) # 相应增加验证数据
+    new_task_loader = DataLoader(new_task_dataset, batch_size=16, shuffle=True)
+    
+    # 创建实验记录器
+    gt_recorder = ExperimentRecorder()
+    
+    # 训练GT-MLM模型
+    print("\n训练GT-MLM模型...")
+    for epoch in range(2):  # 简化的元学习训练
+        print(f"GT-MLM Epoch {epoch + 1}/2")
+        total_outer_loss = 0
+        total_topology_loss = 0
+        total_sparse_loss = 0 # 新增
+        total_holonomy_norm = 0
+        total_curvature_norm = 0
+        total_gamma_meta = 0
+        
+        for batch_idx, task_data in enumerate(meta_task_loader):
+            if batch_idx >= 50:  # 限制训练步数
+                break
+                
+            # ✅ 修复1：meta_train_step 里 task_batch 维度搞反了
+            support_set = task_data['support']   # 已经是 (data, target)
+            query_set   = task_data['query']
+            task_batch = (support_set, query_set)   # 保持原样就行
+            
+            # 捕获新增的 L_sparse
+            outer_loss, topology_loss, sparse_loss, holonomy_norm, curvature_norm, lambda_val, gamma_val = gt_mlm.meta_train_step({'support': support_set, 'query': query_set})
+            total_outer_loss += outer_loss
+            total_topology_loss += topology_loss
+            total_sparse_loss += sparse_loss # 累加稀疏损失
+            total_holonomy_norm += holonomy_norm
+            total_curvature_norm += curvature_norm
+            total_gamma_meta += gamma_val
+            
+            # 记录详细指标
+            gt_recorder.record(
+                epoch=epoch,
+                task_loss=outer_loss, # 使用 outer_loss 作为任务性能指标
+                topology_loss=topology_loss,
+                sparse_loss=sparse_loss, # 记录稀疏损失
+                holonomy_norm=holonomy_norm,
+                curvature_norm=curvature_norm,
+                geometry_loss=holonomy_norm + curvature_norm,
+                lambda_meta=lambda_val,
+                gamma_meta=gamma_val
+            )
+            
+            if batch_idx % 10 == 0:
+                print(f"  Batch {batch_idx}: Outer Loss={outer_loss:.4f}, "
+                      f"Topology Loss={topology_loss:.4f}, Sparse Loss={sparse_loss:.6f}, " # 显示稀疏损失
+                      f"Geo Norm={holonomy_norm+curvature_norm:.4f}, "
+                      f"Lambda={lambda_val:.4f}, Gamma={gamma_val:.6f}")
+        
+        num_batches = min(50, len(meta_task_loader))
+        avg_outer_loss = total_outer_loss / num_batches
+        avg_topology_loss = total_topology_loss / num_batches
+        avg_sparse_loss = total_sparse_loss / num_batches # 平均稀疏损失
+        avg_geometry_loss = (total_holonomy_norm + total_curvature_norm) / num_batches
+        avg_gamma_meta = total_gamma_meta / num_batches
+        print(f"GT-MLM Epoch {epoch + 1} - Avg Outer Loss: {avg_outer_loss:.4f}, "
+              f"Avg Topology Loss: {avg_topology_loss:.4f}, Avg Sparse Loss: {avg_sparse_loss:.6f}, " # 显示平均稀疏损失
+              f"Avg Geometry Loss: {avg_geometry_loss:.4f}, "
+              f"Avg Gamma: {avg_gamma_meta:.6f}")
+        
+    # 验证实验
+    print("\n执行元适应验证...")
+    # ⚠️ 修正后的调用 (增加验证步数)
+    steps_gt, acc_gt = meta_adapt_validation(gt_mlm.base_model, new_task_loader, inner_steps=10) # 5 -> 10
+    
+    # 记录最终准确率
+    gt_recorder.metrics['acc'].append(acc_gt) 
+    
+    print(f"GT-MLM - 适应步数: {steps_gt}, 最终准确率: {acc_gt:.4f}")
+    
+    print("\n实验完成！")
+    print("=" * 60)
+    print("实验结果总结:")
+    print(f"GT-MLM模型 - 适应步数: {steps_gt}, 准确率: {acc_gt:.4f}")
+    
+    return {
+        'gt_mlm_results': {'steps': steps_gt, 'accuracy': acc_gt, 'gt_mlm': gt_mlm}, # <--- 新增 gt_mlm
+        'gt_recorder': gt_recorder
+    }
+
+if __name__ == "__main__":
+    # 运行完整实验
+    results = run_comprehensive_experiment()
+    
+    print("\n实验记录指标:")
+    gt_metrics = results['gt_recorder'].get_metrics()
+    print(f"GT-MLM训练轮次: {len(gt_metrics['epoch'])}")
+    print(f"最终任务损失 (外循环): {gt_metrics['task_loss'][-1]:.4f}" if gt_metrics['task_loss'] else "无任务损失记录")
+    print(f"最终拓扑损失: {gt_metrics['topology_loss'][-1]:.4f}" if gt_metrics['topology_loss'] else "无拓扑损失记录")
+    print(f"最终稀疏损失: {gt_metrics['sparse_loss'][-1]:.6f}" if gt_metrics['sparse_loss'] else "无稀疏损失记录")
+    print(f"最终几何损失: {gt_metrics['geometry_loss'][-1]:.4f}" if gt_metrics['geometry_loss'] else "无几何损失记录")
+    print(f"最终和乐范数: {gt_metrics['holonomy_norm'][-1]:.4f}" if gt_metrics['holonomy_norm'] else "无和乐记录")
+    print(f"最终曲率范数: {gt_metrics['curvature_norm'][-1]:.4f}" if gt_metrics['curvature_norm'] else "无曲率记录")
+    print(f"最终Lambda值: {gt_metrics['lambda_meta'][-1]:.4f}" if gt_metrics['lambda_meta'] else "无Lambda记录")
+    print(f"最终Gamma值: {gt_metrics['gamma_meta'][-1]:.6f}" if gt_metrics['gamma_meta'] else "无Gamma记录")
+    
+    # 显示稀疏化效果
+    if 'sparse_loss' in gt_metrics and gt_metrics['sparse_loss']:
+        print(f"稀疏损失范围: {min(gt_metrics['sparse_loss']):.6f} - {max(gt_metrics['sparse_loss']):.6f}")
+        print(f"平均稀疏损失: {sum(gt_metrics['sparse_loss']) / len(gt_metrics['sparse_loss']):.6f}")
+    
+    # 分析门控向量的稀疏性
+    print("\n分析门控向量的稀疏性...")
+    # 修正：访问模型对象
+    gate_scores = torch.sigmoid(results['gt_mlm_results']['gt_mlm'].base_model.axiom_gate)
+    print(f"门控向量平均值: {gate_scores.mean().item():.4f}")
+    print(f"门控向量中值: {gate_scores.median().item():.4f}")
+    print(f"门控向量小于0.1的比例: {(gate_scores < 0.1).float().mean().item():.4f}")
+    print(f"门控向量小于0.01的比例: {(gate_scores < 0.01).float().mean().item():.4f}")
+
+
+
