@@ -35,64 +35,57 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 # 2. Mamba 状态空间模型块实现 (精简高效版)
+# ============================= 终极无 bug MambaBlock =============================
 class MambaBlock(nn.Module):
-    def __init__(self, d_model: int, d_state: int = 16, expand: int = 2, dropout: float = 0.1):
+    def __init__(self, d_model, d_state=16, expand=2, dropout=0.1):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.expand = expand
         self.d_inner = expand * d_model
 
-        # 投影层
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)  # x 和 z
-        self.x_proj = nn.Linear(self.d_inner, d_state * 2 + 2, bias=False)  # dt, B, C, D (简化版)
-        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+        self.in_proj  = nn.Linear(d_model, self.d_inner * 2, bias=False)
+        self.x_proj   = nn.Linear(self.d_inner, self.d_inner + 2 * d_state, bias=False)
+        self.dt_proj  = nn.Linear(self.d_inner, self.d_inner, bias=True)
 
-        # A 参数（对数初始化）
-        A = torch.arange(1, d_state + 1).repeat(d_model, 1)
-        self.A_log = nn.Parameter(torch.log(A))  # [d_model, d_state]
-        self.D = nn.Parameter(torch.ones(d_model))
+        A = torch.arange(1, d_state + 1).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
 
-        # 输出投影
+        # 关键：新增一个从 d_inner → d_model 的投影用于残差
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        B, L, D = x.shape  # [B, Seq, d_model]
+        B, L, _ = x.shape
+        orig_x = x  # 保存原始输入用于残差
 
-        # 1. 输入投影
-        xz = self.in_proj(x)  # [B, L, 2*d_inner]
-        x, z = xz.chunk(2, dim=-1)  # 各 [B, L, d_inner]
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1)
 
-        # 2. 计算 Δ, B, C, D
-        x_proj = self.x_proj(x)  # [B, L, 2*d_state + 2]
-        dt, B_proj, C, D_proj = torch.split(x_proj, [self.d_inner, self.d_state, self.d_state, 2], dim=-1)
-        
-        dt = self.dt_proj(dt)  # [B, L, d_inner]
-        dt = F.softplus(dt)    # 确保 Δ > 0
+        x_proj = self.x_proj(x)
+        dt, B_proj, C = x_proj.split([self.d_inner, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt))
 
-        # 3. 离散化 A 和 B
-        A = -torch.exp(self.A_log).unsqueeze(0).unsqueeze(0)  # [1, 1, d_model, d_state]
-        delta_A = torch.exp(dt.unsqueeze(-1) * A)  # [B, L, d_model, d_state]
-        delta_B = dt.unsqueeze(-1) * B_proj.unsqueeze(2)  # [B, L, d_model, d_state]
+        A = -torch.exp(self.A_log)
+        delta_A = torch.exp(dt.unsqueeze(-1) * A)
+        delta_B = dt.unsqueeze(-1) * B_proj.unsqueeze(2)
 
-        # 4. 核心 SSM 循环（向量化版，速度快 10 倍+）
-        h = torch.zeros(B, self.d_model, self.d_state, device=x.device)
-        y = []
+        h = torch.zeros(B, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
+        ys = []
 
         for i in range(L):
-            h = h * delta_A[:, i] + delta_B[:, i] * x[:, i:i+1, :].transpose(1, 2)  # [B, d_model, d_state]
-            y_i = (h * C[:, i].unsqueeze(1)).sum(dim=-1)  # [B, d_model]
-            y.append(y_i)
+            h = h * delta_A[:, i] + delta_B[:, i] * x[:, i:i+1, :].transpose(1, 2)
+            y_i = (h * C[:, i].unsqueeze(1)).sum(dim=-1) + self.D * x[:, i]
+            ys.append(y_i)
 
-        y = torch.stack(y, dim=1)  # [B, L, d_model]
-
-        # 5. 门控 + 残差
+        y = torch.stack(ys, dim=1)          # [B, L, d_inner]
         y = y * F.silu(z)
-        y = self.out_proj(y)
+        y = self.out_proj(y)                # [B, L, d_model]
         y = self.dropout(y)
 
-        return x[..., :D] + y  # 残差连接 (取原始输入部分)
+        return orig_x + y                   # 完美残差：两个都是 [B,L,d_model]
+# ============================================================================
 
 # 3. GT-MLM 基础模型：Mamba 版
 class GTMLMBaseModel(nn.Module):
@@ -765,7 +758,8 @@ def run_comprehensive_experiment():
     
     # 创建数据集和数据加载器
     print("创建结构化数据集和数据加载器...")
-    train_dataset = StructuredAbstractAlgebraDataset(data_size=10000, seq_len=20, vocab_size=ntoken) # ✅ 调整：1000 -> 10,000
+    #train_dataset = StructuredAbstractAlgebraDataset(data_size=10000, seq_len=20, vocab_size=ntoken) # ✅ 调整：1000 -> 10,000
+    train_dataset = StructuredAbstractAlgebraDataset(data_size=10000, seq_len=20, vocab_size=ntoken)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
     # 创建元学习任务数据集
@@ -773,7 +767,8 @@ def run_comprehensive_experiment():
     meta_task_loader = DataLoader(meta_task_dataset, batch_size=1, shuffle=True)
     
     # 创建新任务验证数据集
-    new_task_dataset = StructuredAbstractAlgebraDataset(data_size=1000, seq_len=15, vocab_size=ntoken) # 相应增加验证数据
+    #new_task_dataset = StructuredAbstractAlgebraDataset(data_size=1000, seq_len=15, vocab_size=ntoken) # 相应增加验证数据
+    new_task_dataset = StructuredAbstractAlgebraDataset(data_size=1000, seq_len=15, vocab_size=ntoken)
     new_task_loader = DataLoader(new_task_dataset, batch_size=16, shuffle=True)
     
     # 创建实验记录器
