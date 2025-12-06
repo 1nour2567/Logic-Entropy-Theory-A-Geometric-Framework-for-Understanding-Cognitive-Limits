@@ -1,0 +1,331 @@
+# =====================================================
+# GT-MLM Mamba Ultimate Edition —— 修正后的可复现版本
+# =====================================================
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import math
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+import higher
+import warnings
+warnings.filterwarnings('ignore')
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
+
+# ====================== 1. Mamba2 官方简化版 ======================
+class MambaBlock(nn.Module):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_inner = expand * d_model
+        self.d_conv = d_conv
+
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
+        self.conv1d = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner,
+                                 kernel_size=d_conv, groups=self.d_inner, padding=d_conv-1)
+        self.x_proj = nn.Linear(self.d_inner, self.d_inner + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+
+        A = torch.arange(1, d_state + 1).repeat(self.d_inner, 1).log()
+        self.A_log = nn.Parameter(A)
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, L, _ = x.shape
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1)
+
+        x = x.transpose(1, 2)
+        x = self.conv1d(x)[..., :L]
+        x = x.transpose(1, 2)
+        x = F.silu(x)
+
+        x_proj = self.x_proj(x)
+        dt, B_proj, C = x_proj.split([self.d_inner, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt))
+
+        A = -torch.exp(self.A_log)
+        dtA = torch.exp(dt.unsqueeze(-1) * A)
+        dtB = dt.unsqueeze(-1) * B_proj.unsqueeze(2)
+
+        h = torch.zeros(B, self.d_inner, self.d_state, device=x.device)
+        ys = []
+        for i in range(L):
+            h = h * dtA[:, i] + dtB[:, i] * x[:, i].unsqueeze(-1)
+            ys.append((h * C[:, i].unsqueeze(1)).sum(-1) + self.D * x[:, i])
+        y = torch.stack(ys, dim=1)
+
+        y = y * F.silu(z)
+        y = self.out_proj(y)
+        return self.dropout(y) + x[..., :self.d_model]
+
+# ====================== 2. 位置编码 ======================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+# ====================== 3. 数据集 ======================
+N_CLASSES = 5
+AXIOM_VOCAB_START = 800
+AXIOM_CLUSTERS = [
+    [800,801,802], [810,811,812], [820,821,822],
+    [830,831,832], [840,841,842]
+]
+
+class StructuredAbstractAlgebraDataset(Dataset):
+    def __init__(self, data_size=8000, seq_len=20, vocab_size=1000, preference_prob=0.4):
+        self.seq_len = seq_len
+        self.preference_prob = preference_prob
+        self.task_labels = torch.randint(0, N_CLASSES, (data_size,))
+        self.data = self._make_data(vocab_size)
+        self.labels = self.task_labels.clone()
+
+    def _make_data(self, vocab_size):
+        data = torch.zeros(len(self.task_labels), self.seq_len, dtype=torch.long)
+        normal_tokens = torch.arange(AXIOM_VOCAB_START)
+        for i in range(len(self.task_labels)):
+            tid = self.task_labels[i].item()
+            pref = AXIOM_CLUSTERS[tid]
+            for t in range(self.seq_len):
+                if np.random.rand() < self.preference_prob:
+                    data[i,t] = np.random.choice(pref)
+                else:
+                    data[i,t] = np.random.choice(normal_tokens.numpy())
+        return data
+
+    def __len__(self): return len(self.task_labels)
+    def __getitem__(self, i): return self.data[i], self.labels[i]
+
+class StructuredMetaLearningTaskDataset(Dataset):
+    def __init__(self, base, n_support=10, n_query=5):
+        self.base = base
+        self.n_support = n_support
+        self.n_query = n_query
+        self.tasks = self._build()
+
+    def _build(self):
+        idxs = [[] for _ in range(N_CLASSES)]
+        for i, l in enumerate(self.base.labels):
+            idxs[l.item()].append(i)
+        tasks = []
+        for lst in idxs:
+            if len(lst) < self.n_support + self.n_query: continue
+            np.random.shuffle(lst)
+            for i in range(0, len(lst)-self.n_support-self.n_query+1, self.n_support+self.n_query):
+                chunk = lst[i:i+self.n_support+self.n_query]
+                tasks.append((chunk[:self.n_support], chunk[self.n_support:]))
+        return tasks
+
+    def __len__(self): return len(self.tasks)
+    def __getitem__(self, i):
+        s_idx, q_idx = self.tasks[i]
+        support_x = torch.stack([self.base[j][0] for j in s_idx])
+        support_y = torch.stack([self.base[j][1] for j in s_idx])
+        query_x  = torch.stack([self.base[j][0] for j in q_idx])
+        query_y  = torch.stack([self.base[j][1] for j in q_idx])
+        return {'support':(support_x.unsqueeze(0), support_y.unsqueeze(0)),
+                'query':(query_x.unsqueeze(0), query_y.unsqueeze(0))}
+
+# ====================== 4. 模型主体 ======================
+class GTMLMUltimate(nn.Module):
+    def __init__(self, ntoken=1000, d_model=384, nlayers=8, max_axioms=100, d_fiber=128):
+        super().__init__()
+        self.d_model = d_model
+        self.encoder = nn.Embedding(ntoken, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, 0.05)
+        self.mamba_layers = nn.ModuleList([MambaBlock(d_model) for _ in range(nlayers)])
+
+        # 公理记忆池
+        self.axiom_memory_pool = nn.Parameter(torch.randn(max_axioms, d_model))
+        self.axiom_gate = nn.Parameter(torch.full((max_axioms,), -5.0))
+        self.axiom_k = nn.Linear(d_model, d_model, bias=False)
+        self.axiom_v = nn.Linear(d_model, d_model, bias=False)
+        self.axiom_proj = nn.Linear(d_model, d_model)
+
+        # 纤维丛
+        self.fiber_proj = nn.Linear(d_model, d_fiber)
+        self.connection = nn.Parameter(torch.eye(d_fiber) + torch.randn(d_fiber, d_fiber)*1e-4)
+        self.structure_net = nn.Sequential(nn.Linear(d_fiber, d_fiber), nn.GELU(), nn.Linear(d_fiber, d_fiber))
+
+        # 修正: 解码器输出应为 N_CLASSES (5-way分类)
+        self.decoder = nn.Linear(d_model, N_CLASSES)
+        nn.init.xavier_uniform_(self.encoder.weight)
+
+    def get_embedding(self, src):
+        x = self.encoder(src) * math.sqrt(self.d_model)
+        x = self.pos_encoder(x)
+        for layer in self.mamba_layers:
+            x = layer(x)
+        return x
+
+    def forward(self, src, return_layers=False):
+        x = self.encoder(src) * math.sqrt(self.d_model)
+        x = self.pos_encoder(x)
+        
+        layers = [x] # 收集初始嵌入层
+        for layer in self.mamba_layers:
+            x = layer(x)
+            layers.append(x) # 收集每一层 Mamba 的输出
+
+        # Gated Linear Attention
+        gate = torch.sigmoid(self.axiom_gate)
+        K = self.axiom_k(self.axiom_memory_pool) * gate.unsqueeze(-1)
+        V = self.axiom_memory_pool * gate.unsqueeze(-1)
+        q = x.mean(1)
+        attn = F.softmax(torch.matmul(q, K.t()) / math.sqrt(self.d_model), dim=-1)
+        attended = torch.matmul(attn, V).unsqueeze(1).expand(-1, x.size(1), -1)
+        x = x + self.axiom_proj(attended)
+
+        out = self.decoder(x)
+        
+        if return_layers:
+            # 返回 logits, 最终 embedding, 所有层输出, gate 状态
+            return out, x, layers, gate 
+        return out, x, gate, None
+
+
+    def compute_geometric_invariants(self, layers):
+        if layers is not None and len(layers) > 0:
+            embed = layers[-1].mean(1)
+            fiber = self.fiber_proj(embed)
+            conn = torch.matmul(fiber, self.connection)
+            trans = self.structure_net(conn)
+            hol = torch.norm(conn - fiber, dim=-1).mean()
+            curv = torch.norm(trans - conn, dim=-1).mean()
+            return hol + curv
+        else:
+            return torch.tensor(0.07, device=device)
+
+# ====================== 5. 拓扑损失 ======================
+def soft_kmeans_topology_loss(mem, k=5, temp=0.05):
+    dist = torch.cdist(mem, mem)
+    w = F.softmax(-dist / temp, dim=-1)
+    centers = torch.einsum('nm,md->nd', w, mem)
+    loss = ((mem.unsqueeze(1) - centers.unsqueeze(0)).norm(dim=-1)**2 * w).sum() / mem.size(0)
+    return loss
+
+# ====================== 6. 训练器 & 验证 ======================
+class MetaTrainer:
+    def __init__(self, model):
+        self.model = model
+        self.meta_opt = optim.Adam(model.parameters(), lr=5e-5, weight_decay=1e-5)
+        self.inner_opt = optim.SGD
+
+    def train_step(self, support, query, inner_steps=12):
+        support_x, support_y = support
+        query_x, query_y = query
+        support_x, query_x = support_x.squeeze(0).to(device), query_x.squeeze(0).to(device)
+        support_y, query_y = support_y.squeeze(0).to(device), query_y.squeeze(0).to(device)
+        
+        # 修正: MAML/Reptile 需要 track_higher_grads=True 才能计算元梯度
+        with higher.innerloop_ctx(self.model, self.inner_opt, track_higher_grads=True) as (fmodel, diffopt):
+            # 内部循环：任务适应
+            for _ in range(inner_steps):
+                logits, _, gate, _ = fmodel(support_x)
+                task_loss = F.cross_entropy(logits.mean(1), support_y)
+                topo_loss = soft_kmeans_topology_loss(fmodel.axiom_memory_pool.detach(), k=N_CLASSES)
+                sparse_loss = gate.mean()
+                loss = task_loss + 0.5 * topo_loss + 0.01 * sparse_loss
+                diffopt.step(loss)
+
+            # Reptile 更新 (使用参数差异计算元梯度)
+            for p, p_fast in zip(self.model.parameters(), fmodel.parameters()):
+                if p.grad is None: p.grad = torch.zeros_like(p)
+                p.grad.data.add_(p_fast.data - p.data, alpha=0.9)
+
+            # 外部循环：Query 评估
+            q_logits, _, q_layers, _ = fmodel(query_x, return_layers=True)
+            q_loss = F.cross_entropy(q_logits.mean(1), query_y)
+            geo_loss = self.model.compute_geometric_invariants(q_layers)
+            total_loss = q_loss + 0.01 * geo_loss
+
+            self.meta_opt.zero_grad()
+            total_loss.backward()
+            self.meta_opt.step()
+
+        acc = (q_logits.mean(1).argmax(-1) == query_y).float().mean().item()
+        return total_loss.item(), acc
+
+def meta_adapt_validation(model, test_loader, inner_steps=15):
+    # 修正: 改为零样本评估，使用模型的 decoder (已修正为 N_CLASSES)
+    model.eval()
+    
+    total_correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for batch_x, batch_y in test_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            
+            # 使用 get_embedding 获取特征
+            emb = model.get_embedding(batch_x)            
+            
+            # 模拟前向传播，通过公理交互层
+            gate = torch.sigmoid(model.axiom_gate)
+            K = model.axiom_k(model.axiom_memory_pool) * gate.unsqueeze(-1)
+            V = model.axiom_memory_pool * gate.unsqueeze(-1)
+            q = emb.mean(1)
+            attn = F.softmax(torch.matmul(q, K.t()) / math.sqrt(model.d_model), dim=-1)
+            attended = torch.matmul(attn, V).unsqueeze(1).expand(-1, emb.size(1), -1)
+            x = emb + model.axiom_proj(attended)
+            
+            # 使用模型解码器进行推理
+            logits = model.decoder(x.mean(1))              
+            
+            pred = logits.argmax(-1)
+            total_correct += (pred == batch_y).sum().item()
+            total += batch_y.size(0)
+            
+    final_acc = total_correct / total if total > 0 else 0.0
+    return 0, final_acc 
+
+# ====================== 7. 主函数 ======================
+def run_ultimate_experiment():
+    # 注意: ntoken=1000, N_CLASSES=5
+    model = GTMLMUltimate(d_model=384, nlayers=8).to(device)
+    trainer = MetaTrainer(model)
+
+    train_ds = StructuredAbstractAlgebraDataset(data_size=8000)
+    meta_train = StructuredMetaLearningTaskDataset(train_ds, n_support=10, n_query=5)
+    meta_loader = DataLoader(meta_train, batch_size=1, shuffle=True)
+
+    test_ds = StructuredAbstractAlgebraDataset(data_size=1000)
+    test_loader = DataLoader(test_ds, batch_size=16, shuffle=False)
+    
+    print(f"开始训练 {N_CLASSES}-way few-shot 分类任务...")
+
+    for epoch in range(3):
+        for i, task in enumerate(meta_loader):
+            if i >= 60: break
+            loss, acc = trainer.train_step(task['support'], task['query'])
+            if i % 10 == 0:
+                print(f"Epoch {epoch} Step {i}: Loss={loss:.4f} Acc={acc:.4f}")
+
+    _, final_acc = meta_adapt_validation(model, test_loader)
+    print(f"\nGT-MLM Mamba Ultimate 最终 {N_CLASSES}-way 零样本准确率: {final_acc:.4f}")
+
+if __name__ == "__main__":
+    run_ultimate_experiment()
+
+
+
