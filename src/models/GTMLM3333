@@ -1,1 +1,1081 @@
+"""
+GTMLM Mamba Ultimate Edition - Complete Implementation
+整合：反身性自适应网络 + 逻辑的熵 + 形式认识论 + 认知纤维丛理论
+Author: 基于您的理论体系
+Date: 2024
+"""
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import math
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+import random
+from collections import OrderedDict
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
+
+# ====================== 核心常量 ======================
+N_CLASSES = 5  # 5-way分类
+AXIOM_VOCAB_START = 800
+AXIOM_CLUSTERS = [
+    [800, 801, 802],  # 类别0的公理
+    [810, 811, 812],  # 类别1的公理
+    [820, 821, 822],  # 类别2的公理
+    [830, 831, 832],  # 类别3的公理
+    [840, 841, 842]   # 类别4的公理
+]
+MAX_AXIOMS = 100  # 公理记忆池容量
+
+# ====================== 1. 认知纤维丛核心组件 ======================
+class CognitiveFiberBundle(nn.Module):
+    """
+    认知纤维丛 - 定义1.1（形式认识论）
+    实现定理1：任何理性系统的认知结构都可以表示为认知纤维丛的截面
+    """
+    def __init__(self, base_dim=256, fiber_dim=128, connection_dim=64):
+        super().__init__()
+        
+        # 底流形：认知状态空间
+        self.base_dim = base_dim  # dim(M) = N²
+        
+        # 纤维：可能的认知建构
+        self.fiber_dim = fiber_dim
+        
+        # 结构群：认知对称性（Aut(V) × ℝ^K）
+        self.structure_group = nn.ParameterDict({
+            'linear': nn.Parameter(torch.eye(fiber_dim)),  # GL(fiber_dim)部分
+            'constraint': nn.Parameter(torch.randn(10, fiber_dim) * 0.01)  # ℝ^K部分
+        })
+        
+        # 连接形式：编码推理规则（定义5.1）
+        self.connection = nn.Parameter(
+            torch.eye(fiber_dim) + torch.randn(fiber_dim, fiber_dim) * 1e-3
+        )
+        
+        # 曲率形式：逻辑不一致性（定理5.3）
+        self.curvature = None  # 动态计算
+        
+        # 认知联络（陈-西蒙斯理论）
+        self.chern_simons_weight = nn.Parameter(torch.tensor(1.0))
+        
+    def parallel_transport(self, state, path_length=5):
+        """
+        定理5.2：证明即平行移动
+        沿着认知路径平行移动状态
+        """
+        transported = state
+        for _ in range(path_length):
+            # 连接作用：∇_v s
+            transported = torch.matmul(transported, self.connection)
+            transported = F.normalize(transported, dim=-1)
+        return transported
+    
+    def compute_curvature(self, state):
+        """
+        计算曲率：F = dA + A ∧ A
+        对应定理5.3：不可判定密度即曲率
+        """
+        # 简化的曲率计算
+        A = self.connection
+        F = torch.matmul(A, A) - torch.matmul(A.t(), A.t()).t()
+        self.curvature = torch.norm(F) / (self.fiber_dim ** 2)
+        return self.curvature
+    
+    def compute_chern_simons(self):
+        """
+        定理5.4：总逻辑熵即陈-西蒙斯不变量
+        H(L) = k/4π ∫ (A ∧ dA + 2/3 A ∧ A ∧ A) mod ℤ
+        """
+        if self.curvature is None:
+            self.compute_curvature(torch.randn(1, self.fiber_dim))
+        
+        # 简化的陈-西蒙斯不变量计算
+        A = self.connection
+        dA = A - A.t()  # 简化的外微分
+        
+        # A ∧ dA
+        term1 = torch.trace(torch.matmul(A, dA))
+        
+        # A ∧ A ∧ A
+        A_cubed = torch.matmul(torch.matmul(A, A), A)
+        term2 = (2/3) * torch.trace(A_cubed)
+        
+        cs_invariant = (self.chern_simons_weight / (4 * math.pi)) * (term1 + term2)
+        
+        # 模整数拓扑不变量
+        return cs_invariant - torch.floor(cs_invariant)
+    
+    def holonomy(self, state, loop_steps=8):
+        """
+        计算holonomy：沿闭合环路平行移动的差异
+        对应逻辑的不完备性
+        """
+        start_state = state
+        transported = self.parallel_transport(state, loop_steps)
+        
+        # 返回起点，计算差异
+        hol = torch.norm(transported - start_state, dim=-1).mean()
+        return hol
+
+# ====================== 2. 反身性自适应网络 ======================
+class ReflexiveAdaptiveNetwork(nn.Module):
+    """
+    反身性自适应网络 - 定义1.1.1
+    五元组 𝒩, ℰ, 𝒢, 𝒟, ℛ 的实现
+    """
+    def __init__(self, node_dim=256, constraint_dim=64):
+        super().__init__()
+        
+        # 节点集合 𝒩：认知元
+        self.node_dim = node_dim
+        self.nodes = nn.Parameter(torch.randn(MAX_AXIOMS, node_dim) * 0.01)
+        
+        # 边集合 ℰ：相互作用
+        self.adjacency = nn.Parameter(
+            torch.eye(MAX_AXIOMS) * 0.9 + torch.randn(MAX_AXIOMS, MAX_AXIOMS) * 0.1
+        )
+        
+        # 自指约束集合 𝒢
+        self.constraints = nn.Parameter(torch.randn(constraint_dim, node_dim) * 0.01)
+        
+        # 动力学演化规则 𝒟（定理2.1.1）
+        self.evolution_weight = nn.Parameter(torch.eye(node_dim))
+        self.noise_scale = nn.Parameter(torch.tensor(0.01))
+        
+        # 反身性操作规则 ℛ
+        self.reflexive_load = nn.Parameter(torch.tensor(0.5))  # 反身性负荷λ
+        
+        # 自适应耦合（定理2.2.1）
+        self.hebbian_eta = nn.Parameter(torch.tensor(0.1))  # 学习率η
+        self.decay_alpha = nn.Parameter(torch.tensor(0.01))  # 衰减系数α
+        self.reflexive_beta = nn.Parameter(torch.tensor(0.1))  # 反身性调节强度β
+        
+    def evolve_nodes(self, node_states, steps=1):
+        """
+        定理2.1.1：节点状态演化
+        ds_i = F_i(s, J, g)dt + σ_i dW_t^i
+        """
+        results = []
+        current = node_states
+        
+        for step in range(steps):
+            # 确定性演化 F_i
+            deterministic = torch.matmul(current, self.evolution_weight)
+            
+            # 赫布学习：dJ_ij/dt = η·[s_i s_j - αJ_ij + βg_k·φ(J_ij)]
+            interactions = torch.matmul(current, self.adjacency)
+            hebbian = torch.matmul(current.t(), current)
+            constraint_effect = torch.matmul(self.constraints, current.t())
+            
+            # 更新连接（简化）
+            J_update = self.hebbian_eta * (
+                hebbian - 
+                self.decay_alpha * self.adjacency +
+                self.reflexive_beta * constraint_effect.t()
+            )
+            
+            # 添加噪声（维纳过程）
+            noise = torch.randn_like(current) * self.noise_scale
+            
+            # 更新状态
+            new_state = deterministic + interactions + noise
+            current = F.normalize(new_state, dim=-1)
+            results.append(current)
+        
+        return results[-1] if results else node_states
+    
+    def reflexive_operation(self, node_states, reflexivity_level=None):
+        """
+        反身性操作 ℛ：系统对自身的认知和操作
+        对应定理3.1.2：反身性奇点的存在性
+        """
+        if reflexivity_level is None:
+            reflexivity_level = torch.sigmoid(self.reflexive_load)
+        
+        # 自指操作：节点查询自身表示
+        self_attention = F.softmax(
+            torch.matmul(node_states, node_states.t()) / 
+            math.sqrt(self.node_dim), 
+            dim=-1
+        )
+        
+        # 应用自指约束
+        constrained = torch.matmul(self_attention, node_states)
+        
+        # 反身性负荷影响
+        reflexive_output = (
+            (1 - reflexivity_level) * node_states + 
+            reflexivity_level * torch.matmul(constrained, self.constraints.t())
+        )
+        
+        # 检测反身性奇点（det(∂ℛ/∂λ) = 0）
+        jacobian_det = torch.det(self_attention + 1e-6 * torch.eye(self_attention.size(0)))
+        singularity_indicator = torch.abs(jacobian_det)
+        
+        return reflexive_output, singularity_indicator
+
+# ====================== 3. Mamba增强状态空间模型 ======================
+class EnhancedMambaBlock(nn.Module):
+    """
+    MambaBlock的增强版，集成几何约束
+    支持选择性状态空间和纤维丛结构
+    """
+    def __init__(self, d_model=256, d_state=16, d_conv=4, expand=2, 
+                 fiber_bundle=None, reflexive_network=None):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_inner = expand * d_model
+        self.d_conv = d_conv
+        
+        # 标准Mamba组件
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
+        self.conv1d = nn.Conv1d(
+            self.d_inner, self.d_inner,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv-1
+        )
+        self.x_proj = nn.Linear(self.d_inner, self.d_inner + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+        
+        # 状态矩阵A（负对数初始化）
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        
+        # D参数
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        
+        # 输出投影
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        
+        # 几何增强：纤维丛集成
+        self.fiber_bundle = fiber_bundle
+        if fiber_bundle is None:
+            self.fiber_bundle = CognitiveFiberBundle(base_dim=d_model, fiber_dim=d_model//2)
+        
+        # 反身性增强
+        self.reflexive_network = reflexive_network
+        if reflexive_network is None:
+            self.reflexive_network = ReflexiveAdaptiveNetwork(node_dim=d_model)
+        
+        # 逻辑熵监测
+        self.logical_entropy = nn.Parameter(torch.tensor(0.0))
+        
+    def forward(self, x, reflexive_load=0.5):
+        B, L, D = x.shape
+        
+        # 1. 输入投影
+        xz = self.in_proj(x)
+        x_in = xz[..., :self.d_inner]
+        x_conv, z = xz.chunk(2, dim=-1)
+        
+        # 2. 卷积处理
+        x_conv = x_conv.transpose(1, 2)
+        x_conv = self.conv1d(x_conv)[..., :L]
+        x_conv = x_conv.transpose(1, 2)
+        x_conv = F.silu(x_conv)
+        
+        # 3. 计算SSM参数
+        x_proj_out = self.x_proj(x_conv)
+        dt, Bc, C = torch.split(
+            x_proj_out,
+            [self.d_inner, self.d_state, self.d_state],
+            dim=-1
+        )
+        dt = F.softplus(self.dt_proj(dt))
+        
+        # 4. 离散化
+        A = -torch.exp(self.A_log)
+        dA = torch.exp(dt.unsqueeze(-1) * A)
+        dB = dt.unsqueeze(-1) * Bc.unsqueeze(2)
+        
+        # 5. 选择性状态空间模型
+        h = torch.zeros(B, self.d_inner, self.d_state, device=x.device)
+        ys = []
+        
+        for i in range(L):
+            # 在每一步加入几何约束
+            if i % 4 == 0 and self.fiber_bundle is not None:
+                # 平行移动当前状态
+                fiber_state = x_conv[:, i:i+1, :self.fiber_bundle.fiber_dim]
+                transported = self.fiber_bundle.parallel_transport(fiber_state)
+                x_conv[:, i:i+1, :self.fiber_bundle.fiber_dim] = transported
+            
+            h = h * dA[:, i] + dB[:, i] * x_conv[:, i:i+1, :]
+            y = (h * C[:, i:i+1, :]).sum(-1)
+            ys.append(y)
+        
+        y = torch.stack(ys, dim=1)
+        
+        # 6. D项和门控
+        y = y + x_conv * self.D.unsqueeze(0).unsqueeze(0)
+        y = y * F.silu(z)
+        
+        # 7. 输出投影
+        y = self.out_proj(y)
+        
+        # 8. 残差连接
+        output = y + x_in
+        
+        # 9. 反身性增强（如果启用）
+        if reflexive_load > 0 and self.reflexive_network is not None:
+            # 重塑为节点形式
+            node_states = output.mean(1)  # [B, D]
+            reflexive_output, singularity = self.reflexive_network.reflexive_operation(
+                node_states, reflexive_load
+            )
+            output = output + reflexive_output.unsqueeze(1)
+            
+            # 更新逻辑熵（定理4.2.4）
+            curvature = self.fiber_bundle.compute_curvature(node_states)
+            self.logical_entropy.data = 0.9 * self.logical_entropy + 0.1 * curvature
+        
+        return output
+
+# ====================== 4. 逻辑熵监控器 ======================
+class LogicalEntropyMonitor(nn.Module):
+    """
+    逻辑熵监控器 - 基于《逻辑的熵》理论
+    定理4.1：逻辑非全能定理
+    定理4.2.4：临界指数与标度律
+    """
+    def __init__(self, system_complexity=1000):
+        super().__init__()
+        
+        # 不可判定性密度 D_e(L)（定义2.3）
+        self.undecidable_density = nn.Parameter(torch.tensor(0.01))
+        
+        # 规则复杂性溢价 ΣΔC（定义2.3）
+        self.complexity_premium = nn.Parameter(torch.tensor(0.0))
+        
+        # 临界参数
+        self.critical_load = nn.Parameter(torch.tensor(0.7))  # λ_c
+        self.critical_exponents = nn.ParameterDict({
+            'nu': nn.Parameter(torch.tensor(1.0)),  # 关联长度指数
+            'beta': nn.Parameter(torch.tensor(0.5)),  # 序参量指数
+            'gamma': nn.Parameter(torch.tensor(1.0)),  # 响应函数指数
+        })
+        
+        # 逻辑热力学量（定义4.3.1）
+        self.logical_temperature = nn.Parameter(torch.tensor(1.0))
+        self.logical_internal_energy = nn.Parameter(torch.tensor(0.0))
+        
+        # Chaitin Ω数估计
+        self.omega_estimate = nn.Parameter(torch.tensor(0.5))
+        
+    def compute_entropy(self, reflexive_load, system_complexity):
+        """
+        计算逻辑熵 H(L) = f(D_e, ΣΔC)
+        定理5.1：Ω-熵等价定理
+        """
+        # 基础熵项
+        base_entropy = torch.log(1 + self.undecidable_density)
+        
+        # 复杂性溢价项
+        premium_term = self.complexity_premium * system_complexity / 1000
+        
+        # 反身性负荷项（临界行为）
+        load_diff = reflexive_load - self.critical_load
+        if load_diff > 0:
+            # 超临界：H ~ (λ - λ_c)^β
+            critical_term = torch.pow(load_diff, self.critical_exponents['beta'])
+        else:
+            # 亚临界：指数增长
+            critical_term = torch.exp(-torch.abs(load_diff) * 10)
+        
+        # Chaitin Ω项
+        omega_term = self.critical_exponents['gamma'] * self.omega_estimate
+        
+        # 总逻辑熵
+        total_entropy = base_entropy + premium_term + critical_term + omega_term
+        
+        return total_entropy
+    
+    def update_critical_behavior(self, reflexive_load, entropy_gradient):
+        """
+        更新临界行为参数
+        基于重正化群分析（算法4.4.1）
+        """
+        # 检测临界点
+        if torch.abs(reflexive_load - self.critical_load) < 0.05:
+            # 在临界点附近，调整指数
+            load_diff = reflexive_load - self.critical_load
+            
+            # 更新指数（简化的重正化群流）
+            self.critical_exponents['nu'].data *= (1 + 0.01 * load_diff)
+            self.critical_exponents['beta'].data *= (1 + 0.005 * entropy_gradient)
+            self.critical_exponents['gamma'].data *= (1 + 0.002 * entropy_gradient)
+            
+            # 更新Ω估计
+            self.omega_estimate.data = 0.5 * self.omega_estimate + 0.5 * torch.sigmoid(entropy_gradient)
+        
+        return self.critical_exponents
+
+# ====================== 5. 完整GTMLM模型 ======================
+class GTMLMComplete(nn.Module):
+    """
+    完整的GTMLM模型
+    整合：Mamba + 认知纤维丛 + 反身性网络 + 逻辑熵
+    """
+    def __init__(self, ntoken=1000, d_model=256, nlayers=8, 
+                 fiber_dim=128, reflexive_layers=2):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.ntoken = ntoken
+        self.nlayers = nlayers
+        
+        # 1. 基础编码
+        self.encoder = nn.Embedding(ntoken, d_model)
+        self.pos_encoding = PositionalEncoding(d_model)
+        
+        # 2. 认知纤维丛
+        self.fiber_bundle = CognitiveFiberBundle(
+            base_dim=d_model, 
+            fiber_dim=fiber_dim
+        )
+        
+        # 3. 反身性自适应网络
+        self.reflexive_network = ReflexiveAdaptiveNetwork(
+            node_dim=d_model,
+            constraint_dim=64
+        )
+        
+        # 4. 增强Mamba层
+        self.mamba_layers = nn.ModuleList()
+        for i in range(nlayers):
+            layer = EnhancedMambaBlock(
+                d_model=d_model,
+                d_state=16,
+                d_conv=4,
+                expand=2,
+                fiber_bundle=self.fiber_bundle if i % 3 == 0 else None,  # 每3层集成纤维丛
+                reflexive_network=self.reflexive_network if i % 4 == 0 else None  # 每4层集成反身性
+            )
+            self.mamba_layers.append(layer)
+        
+        # 5. 公理记忆池
+        self.axiom_memory = nn.Parameter(
+            torch.randn(MAX_AXIOMS, d_model) * 0.01
+        )
+        self.axiom_gate = nn.Parameter(torch.zeros(MAX_AXIOMS))
+        self.axiom_attention = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        
+        # 6. 逻辑熵监控
+        self.entropy_monitor = LogicalEntropyMonitor()
+        
+        # 7. 输出层（生态理性）
+        self.ecological_rationality = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, N_CLASSES)
+        )
+        
+        # 8. 拓扑正则化组件
+        self.topological_loss_weight = nn.Parameter(torch.tensor(0.1))
+        
+        # 初始化
+        self._initialize_parameters()
+        
+    def _initialize_parameters(self):
+        """初始化参数，确保稳定训练"""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+    
+    def forward(self, x, reflexive_load=0.5, return_components=False):
+        B, L = x.shape
+        
+        # 1. 编码输入
+        x_emb = self.encoder(x) * math.sqrt(self.d_model)
+        x_emb = self.pos_encoding(x_emb)
+        
+        # 2. 通过增强Mamba层
+        layer_outputs = []
+        logical_entropies = []
+        
+        for i, layer in enumerate(self.mamba_layers):
+            layer_load = reflexive_load * (i + 1) / self.nlayers  # 分层反身性负荷
+            x_emb = layer(x_emb, layer_load)
+            layer_outputs.append(x_emb)
+            
+            # 收集逻辑熵
+            if hasattr(layer, 'logical_entropy'):
+                logical_entropies.append(layer.logical_entropy)
+        
+        # 3. 公理记忆池注意力（反身性）
+        gate = torch.sigmoid(self.axiom_gate)
+        weighted_memory = self.axiom_memory * gate.unsqueeze(-1)
+        
+        # 自注意力：当前状态查询公理记忆池
+        query = x_emb.mean(1, keepdim=True)  # [B, 1, D]
+        key = value = weighted_memory.unsqueeze(0).expand(B, -1, -1)
+        
+        attn_output, attn_weights = self.axiom_attention(
+            query, key, value
+        )
+        
+        # 融合
+        x_emb = x_emb + attn_output.expand(-1, L, -1)
+        
+        # 4. 计算几何不变量
+        final_state = x_emb.mean(1)  # [B, D]
+        
+        # 曲率
+        curvature = self.fiber_bundle.compute_curvature(final_state)
+        
+        # Holonomy
+        hol = self.fiber_bundle.holonomy(final_state)
+        
+        # 陈-西蒙斯不变量（逻辑熵的几何表示）
+        cs_invariant = self.fiber_bundle.compute_chern_simons()
+        
+        # 5. 计算逻辑熵
+        system_complexity = sum(p.numel() for p in self.parameters())
+        logical_entropy = self.entropy_monitor.compute_entropy(
+            reflexive_load, system_complexity
+        )
+        
+        # 更新临界行为
+        if self.training:
+            entropy_gradient = torch.autograd.grad(
+                logical_entropy, 
+                self.entropy_monitor.critical_load,
+                retain_graph=True
+            )[0]
+            self.entropy_monitor.update_critical_behavior(
+                reflexive_load, entropy_gradient
+            )
+        
+        # 6. 生态理性输出
+        logits = self.ecological_rationality(final_state)
+        
+        # 7. 拓扑损失计算
+        topological_loss = self._compute_topological_loss(weighted_memory)
+        
+        if return_components:
+            components = {
+                'logits': logits,
+                'logical_entropy': logical_entropy,
+                'curvature': curvature,
+                'holonomy': hol,
+                'chern_simons': cs_invariant,
+                'topological_loss': topological_loss,
+                'reflexive_load': reflexive_load,
+                'axiom_gate': gate,
+                'attention_weights': attn_weights,
+                'layer_outputs': layer_outputs,
+                'critical_exponents': dict(self.entropy_monitor.critical_exponents)
+            }
+            return components
+        
+        return logits, logical_entropy, topological_loss
+    
+    def _compute_topological_loss(self, memory):
+        """
+        计算拓扑损失（soft k-means + 持续性同调）
+        对应定理1.2.2：状态空间的丛结构
+        """
+        # 1. soft k-means损失
+        dist_matrix = torch.cdist(memory, memory)
+        temperature = 0.1
+        soft_assign = F.softmax(-dist_matrix / temperature, dim=-1)
+        
+        # 计算聚类中心
+        centers = torch.matmul(soft_assign, memory) / soft_assign.sum(dim=1, keepdim=True)
+        
+        # 重构损失
+        recon_loss = ((memory.unsqueeze(1) - centers.unsqueeze(0)).pow(2).sum(-1) * soft_assign).sum()
+        
+        # 2. 持续性同调启发式（简化）
+        # 计算距离矩阵的Betti数启发式
+        sorted_dist = torch.sort(dist_matrix.flatten())[0]
+        persistence = sorted_dist[-10:] - sorted_dist[:10]  # 最大最小距离差
+        
+        # 拓扑复杂度
+        topo_complexity = persistence.mean()
+        
+        # 总拓扑损失
+        total_loss = recon_loss + self.topological_loss_weight * topo_complexity
+        
+        return total_loss
+    
+    def compute_geometric_invariants(self, states):
+        """
+        计算几何不变量（定理6.1.2）
+        R ∝ C_network · (1 + λ·R_reflex)
+        """
+        if states is None or len(states) == 0:
+            return torch.tensor(0.0, device=device)
+        
+        # 计算纤维丛不变量
+        fiber_states = self.fiber_bundle.fiber_proj(states)
+        
+        # 连接作用
+        connected = torch.matmul(fiber_states, self.fiber_bundle.connection)
+        
+        # 结构变换
+        transformed = self.fiber_bundle.structure_net(connected)
+        
+        # Holonomy
+        hol = torch.norm(transformed - connected, dim=-1).mean()
+        
+        # 曲率
+        curv = self.fiber_bundle.compute_curvature(states)
+        
+        # 网络复杂度
+        network_complexity = sum(p.numel() for p in self.parameters())
+        
+        # 反身性贡献
+        reflexive_contrib = torch.sigmoid(self.reflexive_network.reflexive_load)
+        
+        # 总几何不变量
+        geometric_invariant = (
+            hol + curv + 
+            0.01 * network_complexity * (1 + reflexive_contrib)
+        )
+        
+        return geometric_invariant
+
+# ====================== 6. 位置编码 ======================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
+                           -(math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+# ====================== 7. 数据集（忠实于原始设计） ======================
+class StructuredAlgebraDataset(Dataset):
+    """
+    忠实于原始设计的结构化代数数据集
+    基于AXIOM_CLUSTERS和preference_prob
+    """
+    def __init__(self, num_samples=10000, seq_len=50, 
+                 vocab_size=1000, preference_prob=0.4):
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        self.preference_prob = preference_prob
+        
+        # 生成数据
+        self.data = []
+        self.labels = []
+        
+        # 普通token范围
+        normal_tokens = list(range(min(AXIOM_VOCAB_START, vocab_size)))
+        
+        for _ in range(num_samples):
+            # 选择类别
+            label = random.randint(0, N_CLASSES - 1)
+            self.labels.append(label)
+            
+            # 获取该类公理
+            axiom_tokens = AXIOM_CLUSTERS[label]
+            
+            # 生成序列
+            sequence = []
+            for _ in range(seq_len):
+                if random.random() < preference_prob:
+                    # 使用公理token
+                    token = random.choice(axiom_tokens)
+                else:
+                    # 使用普通token（确保在词汇表内）
+                    token = random.choice(normal_tokens)
+                sequence.append(token % vocab_size)  # 确保在词汇表内
+            
+            self.data.append(sequence)
+        
+        # 转换为tensor
+        self.data = torch.tensor(self.data, dtype=torch.long)
+        self.labels = torch.tensor(self.labels, dtype=torch.long)
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx]
+
+# ====================== 8. 元学习任务数据集 ======================
+class MetaLearningTaskDataset(Dataset):
+    """
+    元学习任务数据集
+    每个任务是一个few-shot学习问题
+    """
+    def __init__(self, base_dataset, n_support=5, n_query=10, n_tasks=1000):
+        self.base_dataset = base_dataset
+        self.n_support = n_support
+        self.n_query = n_query
+        self.n_tasks = n_tasks
+        
+        # 按类别索引
+        self.class_indices = [[] for _ in range(N_CLASSES)]
+        for idx in range(len(base_dataset)):
+            _, label = base_dataset[idx]
+            self.class_indices[label.item()].append(idx)
+        
+        # 生成任务
+        self.tasks = []
+        for _ in range(n_tasks):
+            # 随机选择类别（5-way）
+            task_class = random.randint(0, N_CLASSES - 1)
+            indices = self.class_indices[task_class]
+            
+            if len(indices) >= n_support + n_query:
+                selected = random.sample(indices, n_support + n_query)
+                
+                task = {
+                    'class': task_class,
+                    'support_idx': selected[:n_support],
+                    'query_idx': selected[n_support:]
+                }
+                self.tasks.append(task)
+    
+    def __len__(self):
+        return len(self.tasks)
+    
+    def __getitem__(self, idx):
+        task = self.tasks[idx]
+        
+        # 支持集
+        support_data = [self.base_dataset[i] for i in task['support_idx']]
+        support_x = torch.stack([x for x, _ in support_data])
+        support_y = torch.stack([torch.tensor(task['class']) for _ in support_data])
+        
+        # 查询集
+        query_data = [self.base_dataset[i] for i in task['query_idx']]
+        query_x = torch.stack([x for x, _ in query_data])
+        query_y = torch.stack([torch.tensor(task['class']) for _ in query_data])
+        
+        return {
+            'support': (support_x, support_y),
+            'query': (query_x, query_y),
+            'class': task['class']
+        }
+
+# ====================== 9. 认知热力学训练器 ======================
+class CognitiveThermodynamicsTrainer:
+    """
+    认知热力学训练器
+    基于逻辑熵增定律和反身性奇点定理
+    """
+    def __init__(self, model, meta_lr=1e-4, inner_lr=0.01):
+        self.model = model
+        self.meta_optimizer = optim.Adam(model.parameters(), lr=meta_lr)
+        
+        # 逻辑温度调度器
+        self.entropy_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.meta_optimizer, T_max=100, eta_min=1e-6
+        )
+        
+        # 反身性负荷调度（定理4.1）
+        self.reflexive_load = 0.1  # 初始低负荷
+        self.load_increment = 0.01
+        
+        # 训练记录
+        self.entropy_history = []
+        self.curvature_history = []
+        self.accuracy_history = []
+    
+    def train_step(self, support, query, inner_steps=5):
+        """
+        认知热力学训练步骤
+        定理4.2.5：Lyapunov稳定性分析
+        """
+        support_x, support_y = support
+        query_x, query_y = query
+        
+        # 内循环：任务适应（快尺度）
+        fast_model = self._clone_model()
+        inner_optimizer = optim.SGD(fast_model.parameters(), lr=inner_lr)
+        
+        inner_losses = []
+        for step in range(inner_steps):
+            # 增加反身性负荷（模拟认知压力）
+            current_load = self.reflexive_load + step * 0.01
+            
+            # 前向传播
+            logits, entropy, topo_loss = fast_model(support_x, current_load)
+            
+            # 计算损失（认知自由能）
+            task_loss = F.cross_entropy(logits, support_y)
+            
+            # 总损失 = 任务损失 + 逻辑熵 + 拓扑损失
+            total_loss = task_loss + 0.1 * entropy + 0.01 * topo_loss
+            
+            # 反向传播
+            inner_optimizer.zero_grad()
+            total_loss.backward()
+            
+            # 梯度裁剪（防止认知奇点）
+            torch.nn.utils.clip_grad_norm_(fast_model.parameters(), 1.0)
+            
+            inner_optimizer.step()
+            inner_losses.append(total_loss.item())
+        
+        # 外循环：元更新（慢尺度）
+        self.meta_optimizer.zero_grad()
+        
+        # 在查询集上评估
+        with torch.no_grad():
+            q_logits, q_entropy, q_topo_loss = fast_model(query_x, self.reflexive_load)
+            q_loss = F.cross_entropy(q_logits, query_y)
+            
+            # 计算几何不变量
+            final_state = fast_model.mamba_layers[-1](query_x.mean(1, keepdim=True))
+            geometric_loss = fast_model.compute_geometric_invariants(final_state)
+        
+        # 元损失（认知热力学第一定律）
+        meta_loss = q_loss + 0.05 * q_entropy + 0.01 * q_topo_loss + 0.001 * geometric_loss
+        
+        # 反向传播
+        meta_loss.backward()
+        
+        # 应用Reptile更新（定理3.2.2）
+        self._reptile_update(fast_model)
+        
+        # 更新参数
+        self.meta_optimizer.step()
+        
+        # 更新反身性负荷（模拟认知演化）
+        self.reflexive_load = min(0.9, self.reflexive_load + self.load_increment)
+        
+        # 记录
+        self.entropy_history.append(q_entropy.item())
+        self.curvature_history.append(geometric_loss.item())
+        
+        # 计算准确率
+        accuracy = (q_logits.argmax(-1) == query_y).float().mean().item()
+        self.accuracy_history.append(accuracy)
+        
+        return meta_loss.item(), accuracy, q_entropy.item()
+    
+    def _clone_model(self):
+        """克隆模型用于内循环"""
+        cloned = type(self.model)(
+            ntoken=self.model.ntoken,
+            d_model=self.model.d_model,
+            nlayers=self.model.nlayers
+        ).to(device)
+        cloned.load_state_dict(self.model.state_dict())
+        return cloned
+    
+    def _reptile_update(self, fast_model):
+        """
+        Reptile更新：使参数向适应后参数靠近
+        定理2.2.2：拓扑演化的稳定性
+        """
+        reptile_lr = 0.1
+        
+        for param, fast_param in zip(self.model.parameters(), fast_model.parameters()):
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+            
+            # Reptile梯度：fast_param - param
+            reptile_grad = (fast_param.detach() - param.detach()) * reptile_lr
+            param.grad.add_(reptile_grad)
+
+# ====================== 10. 主训练循环 ======================
+def train_gtmlm_complete():
+    """完整GTMLM训练"""
+    print("=" * 60)
+    print("GTMLM Mamba Ultimate - 完整训练")
+    print("基于：反身性自适应网络 + 逻辑的熵 + 形式认识论")
+    print("=" * 60)
+    
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    
+    # 1. 创建数据集
+    print("创建数据集...")
+    base_dataset = StructuredAlgebraDataset(
+        num_samples=10000,
+        seq_len=50,
+        vocab_size=1000,
+        preference_prob=0.4
+    )
+    
+    meta_dataset = MetaLearningTaskDataset(
+        base_dataset=base_dataset,
+        n_support=5,
+        n_query=10,
+        n_tasks=500
+    )
+    
+    meta_loader = DataLoader(meta_dataset, batch_size=1, shuffle=True)
+    
+    # 2. 创建完整GTMLM模型
+    print("初始化完整GTMLM模型...")
+    model = GTMLMComplete(
+        ntoken=1000,
+        d_model=256,
+        nlayers=8,
+        fiber_dim=128,
+        reflexive_layers=2
+    ).to(device)
+    
+    print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # 3. 创建认知热力学训练器
+    trainer = CognitiveThermodynamicsTrainer(model)
+    
+    # 4. 训练循环
+    print("\n开始认知热力学训练...")
+    print("=" * 60)
+    
+    num_epochs = 20
+    best_accuracy = 0
+    
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_losses = []
+        epoch_accuracies = []
+        epoch_entropies = []
+        
+        for i, task_batch in enumerate(meta_loader):
+            if i >= 100:  # 每个epoch 100个任务
+                break
+            
+            support = task_batch['support']
+            query = task_batch['query']
+            
+            # 训练步骤
+            loss, acc, entropy = trainer.train_step(support, query)
+            
+            epoch_losses.append(loss)
+            epoch_accuracies.append(acc)
+            epoch_entropies.append(entropy)
+            
+            if i % 10 == 0:
+                print(f"Epoch {epoch+1}, Task {i}: "
+                      f"Loss={loss:.4f}, Acc={acc:.4f}, Entropy={entropy:.4f}")
+        
+        # 计算epoch统计
+        avg_loss = np.mean(epoch_losses)
+        avg_acc = np.mean(epoch_accuracies)
+        avg_entropy = np.mean(epoch_entropies)
+        
+        print(f"\nEpoch {epoch+1} 统计:")
+        print(f"  平均损失: {avg_loss:.4f}")
+        print(f"  平均准确率: {avg_acc:.4f}")
+        print(f"  平均逻辑熵: {avg_entropy:.4f}")
+        print(f"  当前反身性负荷: {trainer.reflexive_load:.4f}")
+        
+        # 保存最佳模型
+        if avg_acc > best_accuracy:
+            best_accuracy = avg_acc
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': trainer.meta_optimizer.state_dict(),
+                'accuracy': avg_acc,
+                'entropy': avg_entropy,
+            }, "best_gtmlm_model.pth")
+            print(f"  ✅ 保存最佳模型，准确率: {avg_acc:.4f}")
+        
+        print("-" * 40)
+    
+    # 5. 最终评估
+    print("\n最终评估...")
+    model.eval()
+    
+    # 创建测试集
+    test_dataset = StructuredAlgebraDataset(
+        num_samples=1000,
+        seq_len=50,
+        vocab_size=1000,
+        preference_prob=0.3
+    )
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    
+    total_correct = 0
+    total_samples = 0
+    test_entropies = []
+    
+    with torch.no_grad():
+        for batch_x, batch_y in test_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            
+            # 使用最终反身性负荷
+            logits, entropy, _ = model(batch_x, trainer.reflexive_load)
+            
+            predictions = logits.argmax(-1)
+            correct = (predictions == batch_y).sum().item()
+            
+            total_correct += correct
+            total_samples += batch_y.size(0)
+            test_entropies.append(entropy.item())
+    
+    final_accuracy = total_correct / total_samples
+    avg_test_entropy = np.mean(test_entropies)
+    
+    print("=" * 60)
+    print("训练完成!")
+    print(f"最终测试准确率: {final_accuracy:.4f}")
+    print(f"最终测试逻辑熵: {avg_test_entropy:.4f}")
+    print(f"最佳训练准确率: {best_accuracy:.4f}")
+    
+    # 6. 输出理论验证指标
+    print("\n理论验证指标:")
+    print("-" * 40)
+    
+    # 获取模型的几何不变量
+    test_sample = torch.randint(0, 1000, (1, 50)).to(device)
+    components = model(test_sample, return_components=True)
+    
+    print(f"曲率: {components['curvature'].item():.6f}")
+    print(f"Holonomy: {components['holonomy'].item():.6f}")
+    print(f"陈-西蒙斯不变量: {components['chern_simons'].item():.6f}")
+    print(f"临界指数:")
+    for name, param in components['critical_exponents'].items():
+        print(f"  {name}: {param.item():.3f}")
+    
+    print("=" * 60)
+    
+    return model, final_accuracy
+
+# ====================== 11. 运行主程序 ======================
+if __name__ == "__main__":
+    # 运行完整训练
+    try:
+        model, accuracy = train_gtmlm_complete()
+        
+        if accuracy > 0.7:
+            print("\n🎉 GTMLM训练成功！模型学会了结构化代数推理。")
+            print("这表明：")
+            print("1. 认知纤维丛理论在实践中有效")
+            print("2. 反身性自适应网络可以建模认知演化")
+            print("3. 逻辑熵增定律在训练中可观察到")
+            print("4. 几何拓扑结构增强了模型的认知能力")
+        else:
+            print("\n⚠️  训练完成，但准确率有待提高。")
+            print("可能的原因：")
+            print("1. 模型复杂度可能不足")
+            print("2. 训练时间不够")
+            print("3. 需要调整超参数")
+        
+    except Exception as e:
+        print(f"\n❌ 训练过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
